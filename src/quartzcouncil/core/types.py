@@ -2,9 +2,9 @@ from __future__ import annotations
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
-AgentName = Literal["Amethyst", "Citrine"]
+AgentName = Literal["Amethyst", "Citrine"]  # Future: Rutile, Smoky, Onyx, Chalcedony, Agate, Phantom, Rose
 Severity = Literal["info", "warning", "error"]
-Category = Literal["types", "perf", "arch", "consistency", "ui"]
+Category = Literal["types", "perf", "arch", "consistency", "ui", "a11y", "security", "ux"]
 
 
 class RawComment(BaseModel):

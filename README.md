@@ -61,3 +61,25 @@ src/quartzcouncil/
 - LangChain + OpenAI for agent orchestration
 - FastAPI for webhooks
 - Pydantic for structured output validation
+
+## Roadmap
+
+### Planned Council Members
+
+| Agent | Domain | Category |
+|-------|--------|----------|
+| **Rutile** | Critical-path & interaction performance (hot paths, animation/jank) | `perf` |
+| **Smoky** | Accessibility (keyboard, focus, ARIA, reduced-motion) | `a11y` |
+| **Onyx** | Node/Next server & security (validation, auth leaks, env exposure) | `security` |
+| **Chalcedony** | Consistency & patterns (design system usage, API shape cohesion) | `consistency` |
+| **Agate** | Architecture (boundaries, ownership, coupling) | `arch` |
+| **Phantom** | Refactors & legacy risk (state evolution, regression traps) | `arch` |
+| **Rose** | UX heuristics (interaction clarity, comfort, motion restraint) | `ux` |
+
+### Pipeline Vision
+
+```
+PR Diff → File Router → Specialist Agents (parallel) → Moderator → GitHub inline comments + summary
+```
+
+Future versions will route diffs by file type to only relevant agents, reducing noise and cost.
