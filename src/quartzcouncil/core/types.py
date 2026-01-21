@@ -6,8 +6,9 @@ AgentName = Literal["Amethyst", "Citrine"]
 Severity = Literal["info", "warning", "error"]
 Category = Literal["types", "perf", "arch", "consistency", "ui"]
 
-class ReviewComment(BaseModel):
-    agent: AgentName
+
+class RawComment(BaseModel):
+    """LLM output — no agent field, injected later in code."""
     file: str
     line_start: int = Field(ge=1)
     line_end: int = Field(ge=1)
@@ -15,3 +16,8 @@ class ReviewComment(BaseModel):
     category: Category
     message: str
     suggestion: Optional[str] = None
+
+
+class ReviewComment(RawComment):
+    """Final comment with agent metadata attached."""
+    agent: AgentName
