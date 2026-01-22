@@ -44,21 +44,52 @@ Trigger → Fetch PR Diff → Specialist Agents (parallel) → Moderator → Git
 - **High-signal, low-noise** — Specialized agents with narrow focus areas
 - **Opt-in by default** — Webhook events are notifications, not triggers
 
-## Setup
+## Development Setup
+
+### 1. Install Dependencies
 
 ```bash
-# Install dependencies
 uv sync
+```
 
-# Set environment variables
-cp .env.example .env
-# Edit .env with your keys
+### 2. Configure Environment
 
-# Run the server
+Create a `.env` file with:
+
+```bash
+OPENAI_API_KEY=sk-...
+GITHUB_WEBHOOK_SECRET=your-webhook-secret
+GITHUB_APP_ID=123456
+GITHUB_PRIVATE_KEY_PATH=secrets/quartzcouncil.private-key.pem
+```
+
+### 3. Run the Server
+
+```bash
 uv run ./src/quartzcouncil/__main__.py
 ```
 
 Server runs at `http://localhost:8000` with hot-reload enabled.
+
+### 4. Expose Local Server (ngrok)
+
+To receive GitHub webhooks locally:
+
+```bash
+# Terminal 1: Start the server
+uv run ./src/quartzcouncil/__main__.py
+
+# Terminal 2: Start ngrok tunnel
+ngrok http 8000
+```
+
+Copy the ngrok HTTPS URL (e.g., `https://abc123.ngrok-free.app`) and set it as your GitHub App's webhook URL:
+
+```
+https://abc123.ngrok-free.app/github/webhook
+```
+
+Note: ngrok requires a free account. Run `ngrok config add-authtoken <token>` after signing up.
 
 ## Environment Variables
 

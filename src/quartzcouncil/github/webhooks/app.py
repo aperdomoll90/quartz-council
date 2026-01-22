@@ -2,6 +2,9 @@ import os
 import hmac
 import hashlib
 from fastapi import FastAPI, Request, HTTPException
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
