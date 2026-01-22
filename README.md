@@ -1,10 +1,34 @@
 # QuartzCouncil
 
-A GitHub App that reviews pull requests using a multi-agent "review council" architecture.
+An opt-in, on-demand AI pull request reviewer that runs only when explicitly requested by a developer.
+
+## What It Is
+
+QuartzCouncil is a GitHub App backend that provides AI-powered code review using a multi-agent "review council" architecture. It is **not** an automatic reviewer — it never runs unless a developer explicitly triggers it.
 
 ## How It Works
 
-Two specialized reviewer agents run in parallel, then a Moderator merges, deduplicates, and posts the final feedback as inline GitHub PR review comments.
+### Triggering a Review
+
+To request a review, comment on any pull request:
+
+```
+/quartz review
+```
+
+QuartzCouncil listens for `issue_comment.created` webhook events. When it detects this command on a PR, it runs the review pipeline. All other webhook events are ignored.
+
+### Review Pipeline
+
+```
+Trigger → Fetch PR Diff → Specialist Agents (parallel) → Moderator → GitHub inline comments + summary
+```
+
+1. Developer comments `/quartz review` on a PR
+2. QuartzCouncil fetches the PR files and diffs
+3. Specialized reviewer agents analyze the code in parallel
+4. The Quartz moderator merges, deduplicates, and summarizes feedback
+5. Results are posted as inline PR comments + one summary comment
 
 ### Council Members
 
@@ -14,6 +38,12 @@ Two specialized reviewer agents run in parallel, then a Moderator merges, dedupl
 | **Citrine** | React/Next.js Quality | Re-renders, effect lifecycle, memo misuse, event listener leaks, server/client boundaries, hook correctness |
 | **Quartz** | Moderator | Deduplicates overlapping comments, normalizes severity, enforces comment limits, generates summary |
 
+## Design Principles
+
+- **Developer control** — Reviews run only when explicitly requested
+- **High-signal, low-noise** — Specialized agents with narrow focus areas
+- **Opt-in by default** — Webhook events are notifications, not triggers
+
 ## Setup
 
 ```bash
@@ -22,7 +52,7 @@ uv sync
 
 # Set environment variables
 cp .env.example .env
-# Edit .env with your OPENAI_API_KEY
+# Edit .env with your keys
 
 # Run the server
 uv run ./src/quartzcouncil/__main__.py
@@ -37,6 +67,9 @@ Server runs at `http://localhost:8000` with hot-reload enabled.
 | `OPENAI_API_KEY` | (required) | Your OpenAI API key |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model for review agents |
 | `OPENAI_TEMPERATURE` | `0.1` | Temperature for LLM calls |
+| `GITHUB_WEBHOOK_SECRET` | (required) | Webhook secret from GitHub App settings |
+| `GITHUB_APP_ID` | (required) | Your GitHub App ID |
+| `GITHUB_PRIVATE_KEY_PATH` | `secrets/quartzcouncil.private-key.pem` | Path to GitHub App private key |
 
 ## Project Structure
 
@@ -64,6 +97,10 @@ src/quartzcouncil/
 
 ## Roadmap
 
+### Future Triggers
+
+- **GitHub Check Run button** — Trigger reviews via GitHub's native Checks interface instead of a comment
+
 ### Planned Council Members
 
 | Agent | Domain | Category |
@@ -75,11 +112,3 @@ src/quartzcouncil/
 | **Agate** | Architecture (boundaries, ownership, coupling) | `arch` |
 | **Phantom** | Refactors & legacy risk (state evolution, regression traps) | `arch` |
 | **Rose** | UX heuristics (interaction clarity, comfort, motion restraint) | `ux` |
-
-### Pipeline Vision
-
-```
-PR Diff → File Router → Specialist Agents (parallel) → Moderator → GitHub inline comments + summary
-```
-
-Future versions will route diffs by file type to only relevant agents, reducing noise and cost.
