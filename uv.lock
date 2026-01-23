@@ -1443,7 +1443,7 @@ wheels = [
 ]
 
 [[package]]
-name = "quartzcouncil"
+name = "quartz-council"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -1454,6 +1454,7 @@ dependencies = [
     { name = "openai" },
     { name = "pydantic" },
     { name = "pygithub" },
+    { name = "pyjwt" },
     { name = "python-dotenv" },
     { name = "streamlit" },
     { name = "uvicorn" },
@@ -1475,6 +1476,7 @@ requires-dist = [
     { name = "openai", specifier = ">=2.15.0" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pygithub", specifier = ">=2.8.1" },
+    { name = "pyjwt", specifier = ">=2.10.1" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "streamlit", specifier = ">=1.53.0" },
     { name = "uvicorn", specifier = ">=0.40.0" },

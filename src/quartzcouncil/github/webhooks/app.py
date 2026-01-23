@@ -1,8 +1,14 @@
 import os
 import hmac
 import hashlib
+import traceback
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
+
+from quartzcouncil.github.auth import get_installation_token
+from quartzcouncil.github.pr import fetch_pr_files
+from quartzcouncil.core.pr_models import PullRequestInput, PullRequestFile
+from quartzcouncil.agents.quartz import review_council
 
 load_dotenv()
 
@@ -56,19 +62,42 @@ async def github_webhook(request: Request):
     # Only trigger on explicit command in PR conversation
     if event == "issue_comment" and payload.get("action") == "created":
         if _is_pr_issue_comment(payload) and _is_quartz_review_command(payload):
-            # Phase 1: log only
-            repo = payload["repository"]["full_name"]
-            pr_url = payload["issue"]["pull_request"]["html_url"]
-            print(f"[QuartzCouncil] Triggered review via command. repo={repo} pr={pr_url}")
-        
-            
-            print("[QuartzCouncil] ✅ COMMAND TRIGGERED: /quartz review")
-            print("[QuartzCouncil] event=", event, "action=", payload.get("action"))
-            print("[QuartzCouncil] repo=", payload["repository"]["full_name"])
-            print("[QuartzCouncil] installation_id=", payload.get("installation", {}).get("id"))
-            print("[QuartzCouncil] issue_number=", payload["issue"]["number"])
-            
-            return {"ok": True, "triggered": True}
+            try:
+                repo_full = payload["repository"]["full_name"]
+                owner, repo_name = repo_full.split("/")
+
+                installation_id = int(payload["installation"]["id"])
+                pr_number = int(payload["issue"]["number"])
+                title = payload["issue"]["title"]
+
+                print(f"[QuartzCouncil] 🔎 Fetching PR files: {owner}/{repo_name} #{pr_number}")
+
+                token = await get_installation_token(installation_id)
+                gh_files = await fetch_pr_files(owner, repo_name, pr_number, token)
+
+                files: list[PullRequestFile] = []
+                for gh_file in gh_files:
+                    patch = gh_file.get("patch")
+                    if not patch:
+                        continue
+                    files.append(PullRequestFile(filename=gh_file["filename"], patch=patch))
+
+                pr_input = PullRequestInput(number=pr_number, title=title, files=files)
+
+                print(f"[QuartzCouncil] 🤖 Running council on {len(files)} patched files...")
+                review = await review_council(pr_input)
+
+                print("[QuartzCouncil] ✅ COUNCIL SUMMARY\n" + review.summary)
+                print(f"[QuartzCouncil] ✅ COMMENTS: {len(review.comments)}")
+                for comment in review.comments:
+                    print(f"[QuartzCouncil] [{comment.agent}] {comment.file}:{comment.line_start}-{comment.line_end} {comment.severity} {comment.category} — {comment.message}")
+
+                return {"ok": True, "triggered": True, "comments": len(review.comments)}
+
+            except Exception as error:
+                print(f"[QuartzCouncil] ❌ ERROR: {error}")
+                traceback.print_exc()
+                return {"ok": False, "triggered": True, "error": str(error)}
 
     # Default: ignore
     return {"ok": True, "triggered": False}
