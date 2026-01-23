@@ -1,13 +1,48 @@
 from __future__ import annotations
 import asyncio
-import os
+from pathlib import Path
 
 from pydantic import BaseModel
 
 from quartzcouncil.core.types import ReviewComment
-from quartzcouncil.core.pr_models import PullRequestInput
+from quartzcouncil.core.pr_models import PullRequestInput, PullRequestFile
 from quartzcouncil.agents.amethyst import review_amethyst
 from quartzcouncil.agents.citrine import review_citrine
+
+
+# =============================================================================
+# FILE TYPE ROUTING
+# =============================================================================
+# Currently permissive - agents see files they might be able to review.
+# This is a wireframe for tightening later.
+#
+# TODO: Tighten these filters as we learn what each agent handles well:
+# - Amethyst could potentially exclude .js (non-typed) or config files
+# - Citrine could exclude non-component files (utils, constants, etc.)
+# - Consider adding content-based detection (e.g., "use client" directive)
+# =============================================================================
+
+# Amethyst: TypeScript type safety reviewer
+# Permissive: includes JS/JSX since they may have JSDoc types or be migrated
+# TODO: For now includes .py for testing on this repo - remove later
+AMETHYST_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".py"}
+
+# Citrine: React/Next.js reviewer
+# Permissive: same as Amethyst since React can be in any JS/TS file
+# TODO: Could detect React imports or hooks to filter more precisely
+# TODO: For now includes .py for testing on this repo - remove later
+CITRINE_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".py"}
+
+
+def _filter_files_for_agent(
+    files: list[PullRequestFile],
+    extensions: set[str],
+) -> list[PullRequestFile]:
+    """Filter PR files to only those matching the given extensions."""
+    return [
+        pr_file for pr_file in files
+        if Path(pr_file.filename).suffix.lower() in extensions
+    ]
 
 
 class CouncilReview(BaseModel):
@@ -109,16 +144,51 @@ async def review_council(
     """
     Run the Quartz council review.
 
-    Executes Amethyst and Citrine in parallel, deduplicates overlapping
-    comments, and generates a summary.
+    Routes files to relevant agents, executes in parallel, deduplicates
+    overlapping comments, and generates a summary.
     """
-    # Run both agents in parallel
-    amethyst_comments, citrine_comments = await asyncio.gather(
-        review_amethyst(pr),
-        review_citrine(pr),
+    # Route files to agents based on extension
+    # Currently permissive - both agents see JS/TS files
+    # TODO: Tighten routing as we learn agent strengths
+    amethyst_files = _filter_files_for_agent(pr.files, AMETHYST_EXTENSIONS)
+    citrine_files = _filter_files_for_agent(pr.files, CITRINE_EXTENSIONS)
+
+    # Build filtered PR inputs for each agent
+    amethyst_pr = PullRequestInput(
+        number=pr.number,
+        title=pr.title,
+        files=amethyst_files,
+        base_sha=pr.base_sha,
+        head_sha=pr.head_sha,
+    )
+    citrine_pr = PullRequestInput(
+        number=pr.number,
+        title=pr.title,
+        files=citrine_files,
+        base_sha=pr.base_sha,
+        head_sha=pr.head_sha,
     )
 
-    all_comments = amethyst_comments + citrine_comments
+    # Run agents in parallel (only if they have files to review)
+    tasks = []
+    if amethyst_files:
+        tasks.append(review_amethyst(amethyst_pr))
+    if citrine_files:
+        tasks.append(review_citrine(citrine_pr))
+
+    if not tasks:
+        # No reviewable files - return empty review
+        return CouncilReview(
+            comments=[],
+            summary="No reviewable files found (no .ts, .tsx, .js, .jsx files in this PR).",
+        )
+
+    results = await asyncio.gather(*tasks)
+
+    all_comments: list[ReviewComment] = []
+    for agent_comments in results:
+        all_comments.extend(agent_comments)
+
     final_comments = _deduplicate(all_comments, max_comments=max_comments)
     summary = _generate_summary(final_comments)
 
