@@ -21,14 +21,20 @@ QuartzCouncil listens for `issue_comment.created` webhook events. When it detect
 ### Review Pipeline
 
 ```
-Trigger → Fetch PR Diff → Specialist Agents (parallel) → Moderator → GitHub inline comments + summary
+Trigger → Rate Check → Idempotency Check → Fetch Diff → Batch & Route → Agents → Sanitize → Dedupe → Publish
 ```
 
 1. Developer comments `/quartz review` on a PR
-2. QuartzCouncil fetches the PR files and diffs
-3. Specialized reviewer agents analyze the code in parallel
-4. The Quartz moderator merges, deduplicates, and summarizes feedback
-5. Results are posted as inline PR comments + one summary comment
+2. Rate limit check (5 reviews/hour/installation)
+3. Idempotency check (skip if commit already reviewed, link to existing)
+4. QuartzCouncil fetches the PR files and diffs
+5. Files are sorted by priority and batched by size
+6. Specialized reviewer agents analyze batches in parallel
+7. Agent-level filters remove hedging and false positive patterns
+8. Moderator sanity gate downgrades speculative ERRORs, drops known false positives
+9. Content-based deduplication removes similar comments
+10. Comments are snapped to nearest valid diff line for inline posting
+11. Results are posted as inline PR comments + one summary comment
 
 ### Council Members
 
@@ -36,13 +42,15 @@ Trigger → Fetch PR Diff → Specialist Agents (parallel) → Moderator → Git
 |-------|------|-------------|
 | **Amethyst** | TypeScript Correctness | `any`/`unknown` misuse, unsafe casting, missing narrowing, generics, Zod schema drift |
 | **Citrine** | React/Next.js Quality | Re-renders, effect lifecycle, memo misuse, event listener leaks, server/client boundaries, hook correctness |
-| **Quartz** | Moderator | Deduplicates overlapping comments, normalizes severity, enforces comment limits, generates summary |
+| **Quartz** | Moderator | Deduplicates comments, sanitizes false positives, normalizes severity, enforces limits, generates summary |
 
 ## Design Principles
 
 - **Developer control** — Reviews run only when explicitly requested
 - **High-signal, low-noise** — Specialized agents with narrow focus areas
 - **Opt-in by default** — Webhook events are notifications, not triggers
+- **Evidence required** — ERROR severity requires proof in the diff, not speculation
+- **Idempotent** — Same commit won't be reviewed twice (links to existing review)
 
 ## Development Setup
 
@@ -97,26 +105,35 @@ Note: ngrok requires a free account. Run `ngrok config add-authtoken <token>` af
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | (required) | Your OpenAI API key |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model for review agents |
-| `OPENAI_TEMPERATURE` | `0.1` | Temperature for LLM calls |
+| `OPENAI_TEMPERATURE` | `0` | Temperature for LLM calls (0 = deterministic) |
 | `GITHUB_WEBHOOK_SECRET` | (required) | Webhook secret from GitHub App settings |
 | `GITHUB_APP_ID` | (required) | Your GitHub App ID |
 | `GITHUB_PRIVATE_KEY_PATH` | `secrets/quartzcouncil.private-key.pem` | Path to GitHub App private key |
+| `QUARTZ_IDEMPOTENCY_CHECK` | `true` | Set to `false` to allow multiple reviews per commit (for testing) |
 
 ## Project Structure
 
 ```
 src/quartzcouncil/
 ├── agents/
-│   ├── base.py       # Shared agent execution logic
+│   ├── base.py       # Batched runner, chunking, AgentResult
 │   ├── amethyst.py   # TypeScript reviewer
 │   ├── citrine.py    # React/Next.js reviewer
 │   └── quartz.py     # Moderator (parallel exec, dedupe, summary)
 ├── core/
-│   ├── types.py      # RawComment, ReviewComment, type aliases
-│   └── pr_models.py  # PullRequestInput, PullRequestFile
+│   ├── types.py      # RawComment, ReviewComment, ReviewWarning
+│   ├── pr_models.py  # PullRequestInput, PullRequestFile
+│   └── rate_limit.py # In-memory rate limiter
 └── github/
-    └── webhooks/
-        └── app.py    # FastAPI webhook handlers
+    ├── auth.py       # JWT + installation token exchange
+    ├── pr.py         # Fetch PR files
+    ├── webhooks/
+    │   └── app.py    # FastAPI webhook handlers
+    └── client/
+        ├── github_client.py    # HTTP client wrapper
+        ├── pr_api.py           # PR metadata fetching
+        ├── review_publisher.py # Post reviews to GitHub
+        └── diff_parser.py      # Parse patch hunks for line validation
 ```
 
 ## Tech Stack
@@ -125,6 +142,42 @@ src/quartzcouncil/
 - LangChain + OpenAI for agent orchestration
 - FastAPI for webhooks
 - Pydantic for structured output validation
+- httpx for async HTTP requests
+
+## Limits & Cost Controls
+
+| Control | Value | Purpose |
+|---------|-------|---------|
+| Rate limit | 5 reviews/hour/installation | Prevent spam/abuse |
+| Max batches | 5 per agent (10 total) | Cap API costs |
+| Max file size | 60K chars | Skip generated/minified files |
+| Batch size | ~40K chars, 12 files | Stay within token limits |
+| Max inline comments | 20 | Avoid noisy reviews |
+| Per-batch comments | 5 max | Reduce noise per batch |
+| Line snapping | Enabled | Snap comments to nearest valid diff line |
+
+**Approximate costs (gpt-4o-mini):**
+- Small PR (10 files): ~$0.01
+- Medium PR (50 files): ~$0.05
+- Huge PR (200 files): ~$0.05 (capped at 5 batches)
+
+## Quality Controls
+
+QuartzCouncil uses multiple layers to reduce false positives:
+
+| Layer | Location | What It Does |
+|-------|----------|--------------|
+| Strict prompts | Agent prompts | 95% confidence required, forbidden phrases |
+| Hedging filter | `base.py` | Drops comments with speculative language |
+| False positive filter | `base.py` | Blocks known bad patterns (infinite loop, memory leak) |
+| Moderator sanity gate | `quartz.py` | Downgrades hedging ERRORs to WARNING |
+| Known false positives | `quartz.py` | Drops factually wrong claims (next/image server-only) |
+| Content deduplication | `quartz.py` | Catches similar comments with different wording |
+
+**Reproducibility:**
+- Temperature=0 for deterministic output
+- Content-based seed for same diff → same output
+- Deterministic file ordering (priority → directory → filename)
 
 ## Roadmap
 

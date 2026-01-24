@@ -21,3 +21,10 @@ class RawComment(BaseModel):
 class ReviewComment(RawComment):
     """Final comment with agent metadata attached."""
     agent: AgentName
+
+
+class ReviewWarning(BaseModel):
+    """Warning about something that couldn't be fully reviewed."""
+    kind: Literal["skipped_large_file", "batch_output_limit", "rate_limited"]
+    message: str
+    file: Optional[str] = None
