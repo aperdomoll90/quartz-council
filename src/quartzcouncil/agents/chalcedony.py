@@ -77,9 +77,10 @@ def build_rules_context(cfg: QuartzCouncilConfig) -> str:
     for policy in cfg.policy:
         lines.append(f"- POLICY {policy.id} ({policy.severity}): {policy.text}")
 
-    # Limits
+    # Default severity (do NOT include max_comments - that's handled programmatically)
     lines.append("")
-    lines.append(f"LIMITS: max_comments={cfg.limits.max_comments}, default_severity={cfg.limits.default_severity}")
+    lines.append(f"DEFAULT_SEVERITY: {cfg.limits.default_severity}")
+    lines.append("Report ALL violations you find. Do not self-limit the number of comments.")
 
     return "\n".join(lines)
 
@@ -115,6 +116,25 @@ CATEGORY
 - Use "ui" for CSS/SCSS/styling-related rules
 - Use "arch" for code organization rules (like extract_utils)
 
+FILE TYPE GUIDANCE
+Review ALL file types in the diff, including:
+- .tsx/.jsx files: Check css_modules_access (styles.foo vs styles['foo']), data_attributes, hooks policy
+- .scss/.css files: Check bem_naming (class names must have prefix), scss_nesting (nested selectors must use &)
+- .ts/.js files: Check hooks policy
+
+SCSS-SPECIFIC RULES
+When bem_naming is enabled, check .scss files for:
+- Class names without the required prefix (e.g., .testContainer instead of .c-test-container)
+- Nested selectors that should use BEM element pattern (e.g., .heading should be &__heading or &-heading)
+
+When scss_nesting is enabled with require_ampersand=true, check .scss files for:
+- Nested selectors written as .child instead of &__child or &-child
+- This includes selectors like .heading, .btn, .content nested inside a parent
+
+When data_attributes rule is enabled, check .scss file s for:
+- State classes like .isOpen, .isClosed, .active that should be data-attribute selectors
+- These should be [data-open="true"], [data-active], etc.
+
 {SHARED_RULES}"""
 
 
@@ -126,10 +146,15 @@ def _build_prompt(rules_context: str) -> ChatPromptTemplate:
 
 {diff}
 
-IMPORTANT: Only report violations of rules explicitly defined in REPO RULES.
-If no violations are found, return an empty list.
+IMPORTANT INSTRUCTIONS:
+1. Check EVERY file in the diff above - .tsx, .ts, .scss, .css, .js, .jsx
+2. For each file, apply ALL applicable rules from REPO RULES
+3. Report EVERY violation found - do not summarize or skip similar violations
+4. Each violation on a different line should be a separate comment
+5. Only report violations of rules explicitly defined in REPO RULES
 
-Return structured ReviewComment objects. If no issues, return an empty list.""")
+Return structured ReviewComment objects for ALL violations found.
+If no violations are found, return an empty list.""")
     ])
 
 

@@ -32,6 +32,8 @@ GENERAL_RULES = """GENERAL RULES
 LINE_NUMBER_ACCURACY = """LINE NUMBER ACCURACY (CRITICAL)
 - Each line in the diff is prefixed with its line number (e.g., "L 209 +export function...")
 - line_start MUST match the L### prefix on the line with the issue
+- line_end should equal line_start for single-line issues (most issues are single-line)
+- Only use a range (line_start != line_end) if the issue genuinely spans multiple consecutive lines
 - Do NOT guess - read the L### prefix directly from the diff"""
 
 
@@ -56,7 +58,8 @@ FORBIDDEN_PHRASES = """FORBIDDEN PHRASES (never use these in your comments)
 # =============================================================================
 
 OUTPUT_RULES = """OUTPUT
-Return at most 5 ReviewComment objects. Keep only the highest-severity provable issues.
+Return ALL provable issues you find. Do not self-limit the number of comments.
+Prioritize highest-severity issues but report everything that is a real, demonstrable problem.
 If no real issues, return an empty list. An empty list is a GOOD outcome - it means clean code."""
 
 

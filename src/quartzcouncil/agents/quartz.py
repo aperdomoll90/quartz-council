@@ -187,11 +187,15 @@ def _extract_keywords(text: str) -> set[str]:
 def _comments_similar_by_content(
     new_comment: ReviewComment,
     existing_comment: ReviewComment,
-    similarity_threshold: float = 0.5,
+    similarity_threshold: float = 0.6,
 ) -> bool:
     """
     Return True if two comments have similar content based on keyword overlap.
     Uses Jaccard similarity on extracted keywords.
+
+    Threshold of 0.6 (60%) requires substantial overlap to be considered duplicate.
+    This prevents false deduplication of comments about different issues that
+    happen to use similar language (e.g., "missing cleanup for X" vs "missing cleanup for Y").
     """
     new_keywords = _extract_keywords(new_comment.message)
     existing_keywords = _extract_keywords(existing_comment.message)
@@ -231,7 +235,49 @@ def _is_duplicate_comment(
     return False
 
 
-def _deduplicate(comments: list[ReviewComment], max_comments: int = 20) -> list[ReviewComment]:
+def _merge_comment_messages(existing: ReviewComment, new_comment: ReviewComment) -> ReviewComment:
+    """
+    Merge two comments on the same location into one combined comment.
+    Combines messages with bullet points, keeps highest severity, merges categories.
+    """
+    severity_rank = {"error": 3, "warning": 2, "info": 1}
+
+    # Use highest severity
+    merged_severity = existing.severity if severity_rank[existing.severity] >= severity_rank[new_comment.severity] else new_comment.severity
+
+    # Combine messages with bullet points if not already bulleted
+    existing_msg = existing.message.strip()
+    new_msg = new_comment.message.strip()
+
+    # If existing already has bullets, add new one
+    if existing_msg.startswith("• ") or existing_msg.startswith("- "):
+        merged_message = f"{existing_msg}\n• {new_msg}"
+    else:
+        merged_message = f"• {existing_msg}\n• {new_msg}"
+
+    # Keep category from higher-severity comment (existing is processed first due to sorting)
+    # Category is a Literal type so we can't combine them
+    merged_category = existing.category
+
+    return ReviewComment(
+        file=existing.file,
+        line_start=min(existing.line_start, new_comment.line_start),
+        line_end=max(existing.line_end, new_comment.line_end),
+        severity=merged_severity,
+        category=merged_category,
+        message=merged_message,
+        suggestion=existing.suggestion or new_comment.suggestion,
+        agent=existing.agent,
+    )
+
+
+def _deduplicate(
+    comments: list[ReviewComment],
+    max_comments: int = 20,
+    content_similarity: bool = True,
+    merge_overlapping: bool = False,
+    debug: bool = False,
+) -> list[ReviewComment]:
     """
     Deduplicate overlapping or similar comments, preferring higher severity.
     Limits total comments to avoid noisy reviews.
@@ -239,10 +285,15 @@ def _deduplicate(comments: list[ReviewComment], max_comments: int = 20) -> list[
     Args:
         comments: List of comments to deduplicate
         max_comments: Maximum comments to keep. 0 means no limit (keep all unique).
+        content_similarity: If True, also dedupe by message similarity. If False,
+                           only dedupe by location (same file + overlapping lines).
+        merge_overlapping: If True, merge overlapping comments into one combined comment
+                          instead of dropping duplicates. Useful for Chalcedony.
+        debug: If True, print debug info about what's being merged/dropped.
 
     Deduplication checks:
-    1. Location-based: same file + overlapping lines
-    2. Content-based: same file + similar message keywords
+    1. Location-based: same file + overlapping lines (merge or drop based on merge_overlapping)
+    2. Content-based: same file + similar message keywords (if content_similarity=True)
     """
     severity_rank = {"error": 3, "warning": 2, "info": 1}
 
@@ -252,12 +303,62 @@ def _deduplicate(comments: list[ReviewComment], max_comments: int = 20) -> list[
     )
 
     kept: list[ReviewComment] = []
+    if debug:
+        print(f"[DEBUG] Starting deduplication with {len(sorted_comments)} comments")
+        for idx, c in enumerate(sorted_comments):
+            print(f"[DEBUG]   [{idx}] {c.file}:{c.line_start}-{c.line_end} ({c.severity})")
+
     for comment in sorted_comments:
-        if not _is_duplicate_comment(comment, kept):
+        merged = False
+        is_dup = False
+
+        for idx, existing in enumerate(kept):
+            # Check location overlap
+            if _comments_overlap_by_lines(comment, existing):
+                if debug:
+                    print(f"[DEBUG] OVERLAP: {comment.file}:{comment.line_start}-{comment.line_end} overlaps with kept[{idx}] {existing.file}:{existing.line_start}-{existing.line_end}")
+                if merge_overlapping:
+                    # Merge instead of dropping
+                    kept[idx] = _merge_comment_messages(existing, comment)
+                    if debug:
+                        print(f"[DEBUG]   -> Merged into kept[{idx}], now lines {kept[idx].line_start}-{kept[idx].line_end}")
+                    merged = True
+                else:
+                    if debug:
+                        print(f"[DEBUG]   -> Dropped (overlap, no merge)")
+                    is_dup = True
+                break
+
+            # Only check content similarity if enabled (and not already merged)
+            if content_similarity and comment.file == existing.file:
+                if _comments_similar_by_content(comment, existing):
+                    if debug:
+                        print(f"[DEBUG] SIMILAR: {comment.file}:{comment.line_start} similar to kept[{idx}] {existing.file}:{existing.line_start}")
+                    if merge_overlapping:
+                        kept[idx] = _merge_comment_messages(existing, comment)
+                        if debug:
+                            print(f"[DEBUG]   -> Merged into kept[{idx}]")
+                        merged = True
+                    else:
+                        if debug:
+                            print(f"[DEBUG]   -> Dropped (similar, no merge)")
+                        is_dup = True
+                    break
+
+        if not is_dup and not merged:
             kept.append(comment)
+            if debug:
+                print(f"[DEBUG] KEPT: {comment.file}:{comment.line_start}-{comment.line_end} as kept[{len(kept)-1}]")
         # max_comments=0 means no limit
         if max_comments > 0 and len(kept) >= max_comments:
+            if debug:
+                print(f"[DEBUG] Hit max_comments limit ({max_comments}), stopping")
             break
+
+    if debug:
+        print(f"[DEBUG] Final result: {len(kept)} comments")
+        for idx, c in enumerate(kept):
+            print(f"[DEBUG]   kept[{idx}]: {c.file}:{c.line_start}-{c.line_end}")
 
     return kept
 
@@ -326,20 +427,20 @@ async def review_council(
     """
     Run the Quartz council review.
 
-    Routes files to relevant agents, executes in parallel, deduplicates
-    overlapping comments, and generates a summary.
+    Routes files to relevant agents, executes in parallel, merges overlapping
+    comments, and generates a summary.
 
     Chalcedony (repo conventions) is processed separately from Amethyst/Citrine:
-    - Amethyst + Citrine: sanitized, deduplicated, capped at max_comments
-    - Chalcedony: deduplicated separately, capped by config limits, appended after
+    - Amethyst + Citrine: sanitized, merged (same-line issues combined), capped at max_comments
+    - Chalcedony: merged separately, capped by config limits (default uncapped), appended after
 
-    This ensures repo-specific convention comments are never dropped in favor of
-    bug/type comments - they serve different purposes and shouldn't compete.
+    Comments on the same lines are merged into combined comments with bullet points,
+    preserving all distinct issues while keeping the review focused.
 
     Args:
         pr: Pull request input with files and patches
         cfg: Optional repo config for Chalcedony agent (if None, Chalcedony is skipped)
-        max_comments: Maximum comments for Amethyst+Citrine (Chalcedony has its own limit)
+        max_comments: Maximum distinct locations for Amethyst+Citrine (default 20)
     """
     # Route files to agents based on extension
     # Currently permissive - both agents see JS/TS files
@@ -380,6 +481,7 @@ async def review_council(
     if cfg is not None and cfg.has_any_rules():
         chalcedony_task = review_chalcedony(pr, cfg)
         chalcedony_max_comments = cfg.limits.max_comments
+        print(f"[QuartzCouncil] 🔧 Chalcedony max_comments from config: {chalcedony_max_comments}")
 
     # No agents to run at all
     if not core_tasks and chalcedony_task is None:
@@ -408,8 +510,9 @@ async def review_council(
         all_warnings.extend(agent_result.warnings)
 
     # Moderator sanity gate for core agents
+    # Merge overlapping comments (same location, different agents) into combined comments
     sanitized_core = _sanitize_comments(core_comments)
-    final_core = _deduplicate(sanitized_core, max_comments=max_comments)
+    final_core = _deduplicate(sanitized_core, max_comments=max_comments, merge_overlapping=True)
 
     # ==========================================================================
     # PROCESS CHALCEDONY COMMENTS (separately)
@@ -419,10 +522,25 @@ async def review_council(
     if chalcedony_result:
         all_warnings.extend(chalcedony_result.warnings)
 
+        # Debug: show what files Chalcedony found violations in
+        chalcedony_comments = chalcedony_result.comments
+        files_with_violations = set(comment.file for comment in chalcedony_comments)
+        print(f"[QuartzCouncil] 🔍 Chalcedony raw: {len(chalcedony_comments)} comments in {len(files_with_violations)} files")
+        for idx, comment in enumerate(chalcedony_comments):
+            line_range = f"L{comment.line_start}" if comment.line_start == comment.line_end else f"L{comment.line_start}-{comment.line_end}"
+            print(f"[QuartzCouncil] 🔍   [{idx}] {comment.file}:{line_range} - {comment.message[:50]}...")
+
         # Chalcedony gets its own deduplication (within itself only)
         # No sanitization - repo rules are explicit, not speculative
-        chalcedony_comments = chalcedony_result.comments
-        final_chalcedony = _deduplicate(chalcedony_comments, max_comments=chalcedony_max_comments)
+        # Merge overlapping comments - multiple violations on same line become one combined comment
+        # Disable content similarity - similar wording is expected for convention violations
+        final_chalcedony = _deduplicate(
+            chalcedony_comments,
+            max_comments=chalcedony_max_comments,
+            content_similarity=False,
+            merge_overlapping=True,
+            debug=False,
+        )
 
         if final_chalcedony:
             print(f"[QuartzCouncil] 💎 Chalcedony: {len(final_chalcedony)} convention comments (separate from core)")

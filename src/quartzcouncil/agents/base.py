@@ -252,16 +252,16 @@ HEDGING_PHRASES = [
 # =============================================================================
 
 FALSE_POSITIVE_PATTERNS = [
-    # Context typed as T | null is valid React pattern - not an error
-    ("context", "null", "error"),
+    # REMOVED: ("context", "null", "error") - was filtering legitimate unsafe cast issues
+    # The LLM correctly identifies "return context as ContextType" as unsafe when context is T | null
     # "infinite loop" claims without proof are almost always wrong
     ("infinite loop", None, "error"),
     ("infinite re-render", None, "error"),
     # setState in useEffect is not automatically an infinite loop
     ("setstate", "useeffect", "error"),
     ("set state", "useeffect", "error"),
-    # "without checking" is speculation about missing guards
-    ("without checking", None, "error"),
+    # REMOVED: "without checking" - was filtering legitimate array access and null check errors
+    # ("without checking", None, "error"),
     # "can throw" / "can cause" is speculative
     ("can throw", None, "error"),
     ("can cause", None, "error"),
@@ -330,9 +330,11 @@ def _filter_low_quality_comments(comments: list[ReviewComment], agent_name: str 
     for comment in comments:
         if _is_hedging_comment(comment):
             hedging_dropped += 1
+            print(f"[QuartzCouncil] 🔇 {agent_name} DROPPED (hedging): {comment.file}:{comment.line_start} - {comment.message[:60]}...")
             continue
         if _is_false_positive_error(comment):
             false_positive_dropped += 1
+            print(f"[QuartzCouncil] 🔇 {agent_name} DROPPED (false positive): {comment.file}:{comment.line_start} - {comment.message[:60]}...")
             continue
         filtered.append(comment)
 
