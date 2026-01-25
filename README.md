@@ -42,6 +42,7 @@ Trigger → Rate Check → Idempotency Check → Fetch Diff → Batch & Route �
 |-------|------|-------------|
 | **Amethyst** | TypeScript Correctness | `any`/`unknown` misuse, unsafe casting, missing narrowing, generics, Zod schema drift |
 | **Citrine** | React/Next.js Quality | Re-renders, effect lifecycle, memo misuse, event listener leaks, server/client boundaries, hook correctness |
+| **Chalcedony** | Repo Conventions | Enforces rules from `.quartzcouncil.yml` — BEM naming, SCSS nesting, CSS Modules, data-* attributes, custom policies |
 | **Quartz** | Moderator | Deduplicates comments, sanitizes false positives, normalizes severity, enforces limits, generates summary |
 
 ## Design Principles
@@ -116,14 +117,18 @@ Note: ngrok requires a free account. Run `ngrok config add-authtoken <token>` af
 ```
 src/quartzcouncil/
 ├── agents/
-│   ├── base.py       # Batched runner, chunking, AgentResult
-│   ├── amethyst.py   # TypeScript reviewer
-│   ├── citrine.py    # React/Next.js reviewer
-│   └── quartz.py     # Moderator (parallel exec, dedupe, summary)
+│   ├── base.py        # Batched runner, chunking, AgentResult
+│   ├── amethyst.py    # TypeScript reviewer
+│   ├── citrine.py     # React/Next.js reviewer
+│   ├── chalcedony.py  # Repo conventions reviewer
+│   └── quartz.py      # Moderator (parallel exec, dedupe, summary)
 ├── core/
-│   ├── types.py      # RawComment, ReviewComment, ReviewWarning
-│   ├── pr_models.py  # PullRequestInput, PullRequestFile
-│   └── rate_limit.py # In-memory rate limiter
+│   ├── types.py         # RawComment, ReviewComment, ReviewWarning
+│   ├── pr_models.py     # PullRequestInput, PullRequestFile
+│   ├── config_models.py # QuartzCouncilConfig, RuleToggles, PolicyRule
+│   └── rate_limit.py    # In-memory rate limiter
+├── prompts/
+│   └── shared.py        # Shared prompt fragments
 └── github/
     ├── auth.py       # JWT + installation token exchange
     ├── pr.py         # Fetch PR files
@@ -132,6 +137,7 @@ src/quartzcouncil/
     └── client/
         ├── github_client.py    # HTTP client wrapper
         ├── pr_api.py           # PR metadata fetching
+        ├── config_api.py       # Fetch .quartzcouncil.yml
         ├── review_publisher.py # Post reviews to GitHub
         └── diff_parser.py      # Parse patch hunks for line validation
 ```
@@ -161,6 +167,38 @@ src/quartzcouncil/
 - Medium PR (50 files): ~$0.05
 - Huge PR (200 files): ~$0.05 (capped at 5 batches)
 
+## Security Controls
+
+QuartzCouncil implements defense-in-depth against malicious input:
+
+### Webhook Security
+| Control | Purpose |
+|---------|---------|
+| HMAC-SHA256 signature | Verify webhooks come from GitHub |
+| Installation token scope | Tokens limited to specific repo |
+
+### Config Injection Protection (`.quartzcouncil.yml`)
+
+Repo owners can define custom rules in `.quartzcouncil.yml`. Since policy text is embedded in LLM prompts, we protect against prompt injection:
+
+| Control | Value | Purpose |
+|---------|-------|---------|
+| `MAX_SHORT_STRING` | 50 chars | Limit IDs, prefixes, separators |
+| `MAX_POLICY_TEXT` | 500 chars | Limit freeform policy descriptions |
+| `MAX_POLICIES` | 10 | Cap number of policy rules |
+| `MAX_LIST_ITEMS` | 20 | Cap list fields (allowed_prefixes, etc.) |
+
+**Blocked injection patterns** (at start of policy text):
+- `ignore previous instructions`, `forget all`, `disregard`
+- `override`, `system:`, `assistant:`, `user:`
+- `<system>`, `### system`, `### instruction`
+
+**Additional sanitization:**
+- Control characters stripped (except `\n`, `\t`)
+- Excessive whitespace collapsed
+- Policy IDs restricted to alphanumeric, hyphens, underscores
+- YAML parsed with `safe_load` (no arbitrary Python execution)
+
 ## Quality Controls
 
 QuartzCouncil uses multiple layers to reduce false positives:
@@ -179,6 +217,74 @@ QuartzCouncil uses multiple layers to reduce false positives:
 - Content-based seed for same diff → same output
 - Deterministic file ordering (priority → directory → filename)
 
+## Repo-Specific Rules (Chalcedony)
+
+Chalcedony enforces repo-specific conventions defined in `.quartzcouncil.yml`. If no config exists, Chalcedony is skipped.
+
+### Example Configuration
+
+Create `.quartzcouncil.yml` in your repo root:
+
+```yaml
+version: 1
+
+limits:
+  max_comments: 5
+  default_severity: warning
+
+rules:
+  bem_naming:
+    enabled: true
+    prefix: "c-"
+    element_separator: "__"
+    modifier_separator: "--"
+    severity: warning
+
+  scss_nesting:
+    enabled: true
+    require_ampersand: true
+    severity: warning
+
+  css_modules_access:
+    enabled: true
+    style_object: "styles"
+    bracket_notation_only: true
+    severity: warning
+
+  data_attributes:
+    enabled: true
+    allowed_prefixes: ["data-state", "data-variant", "data-open"]
+    severity: warning
+
+policy:
+  - id: "hooks-naming"
+    severity: warning
+    text: "Custom hooks must be named useX and must not be exported as default."
+```
+
+### Supported Rules
+
+| Rule | Purpose |
+|------|---------|
+| `bem_naming` | BEM class naming conventions with configurable prefix/separators |
+| `scss_nesting` | Require `&` for nested SCSS selectors |
+| `css_modules_access` | Enforce `styles["x"]` vs `styles.x` access patterns |
+| `data_attributes` | Restrict data-* attributes to allowed prefixes |
+| `extract_utils` | Flag duplicate code that should be extracted |
+
+### Freeform Policies
+
+For custom rules not covered by toggles:
+
+```yaml
+policy:
+  - id: "unique-id"
+    severity: warning
+    text: "Description of the rule to enforce"
+```
+
+Chalcedony ONLY enforces rules defined in the config — it never invents or suggests improvements beyond what's specified.
+
 ## Roadmap
 
 ### Future Triggers
@@ -192,7 +298,6 @@ QuartzCouncil uses multiple layers to reduce false positives:
 | **Rutile** | Critical-path & interaction performance (hot paths, animation/jank) | `perf` |
 | **Smoky** | Accessibility (keyboard, focus, ARIA, reduced-motion) | `a11y` |
 | **Onyx** | Node/Next server & security (validation, auth leaks, env exposure) | `security` |
-| **Chalcedony** | Consistency & patterns (design system usage, API shape cohesion) | `consistency` |
 | **Agate** | Architecture (boundaries, ownership, coupling) | `arch` |
 | **Phantom** | Refactors & legacy risk (state evolution, regression traps) | `arch` |
 | **Rose** | UX heuristics (interaction clarity, comfort, motion restraint) | `ux` |

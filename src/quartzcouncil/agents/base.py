@@ -34,11 +34,62 @@ class AgentOutput(BaseModel):
     comments: list[RawComment]
 
 
+def _add_line_numbers_to_patch(patch: str) -> str:
+    """
+    Add explicit line numbers to patch for easier LLM parsing.
+    Transforms raw diff into numbered format showing new-file line numbers.
+    """
+    if not patch:
+        return patch
+
+    import re
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+    result_lines = []
+    current_line = 0
+    in_hunk = False
+
+    for line in patch.split("\n"):
+        hunk_match = hunk_re.match(line)
+        if hunk_match:
+            current_line = int(hunk_match.group(1))
+            in_hunk = True
+            result_lines.append(line)
+            continue
+
+        if not in_hunk:
+            result_lines.append(line)
+            continue
+
+        if not line:
+            result_lines.append(line)
+            continue
+
+        prefix = line[0] if line else ""
+
+        if prefix == "+":
+            # Addition - show line number
+            result_lines.append(f"L{current_line:>4} {line}")
+            current_line += 1
+        elif prefix == "-":
+            # Deletion - no line number (doesn't exist in new file)
+            result_lines.append(f"      {line}")
+        elif prefix == " ":
+            # Context - show line number
+            result_lines.append(f"L{current_line:>4} {line}")
+            current_line += 1
+        else:
+            result_lines.append(line)
+
+    return "\n".join(result_lines)
+
+
 def build_diff(pr: PullRequestInput) -> str:
-    """Format PR files into a readable diff string."""
+    """Format PR files into a readable diff string with line numbers."""
     parts = []
     for pr_file in pr.files:
-        parts.append(f"\n--- FILE: {pr_file.filename} ---\n{pr_file.patch}")
+        numbered_patch = _add_line_numbers_to_patch(pr_file.patch)
+        parts.append(f"\n--- FILE: {pr_file.filename} ---\n{numbered_patch}")
     return "\n".join(parts)
 
 
@@ -174,34 +225,22 @@ def chunk_files_by_char_budget(
 
 
 # =============================================================================
-# HEDGING FILTER
+# HEDGING FILTER (SOFT)
 # =============================================================================
-# LLMs often hedge even when told not to. This filter catches common patterns.
+# Most hedging is handled by the moderator (downgrade ERROR → WARNING).
+# Here we only drop the most egregious "advice-style" comments that add no value.
 # =============================================================================
 
 HEDGING_PHRASES = [
     "consider ",
     "might want to",
-    "could potentially",
-    "may cause",
-    "may lead to",
-    "can lead to",
-    "might lead to",
-    "could lead to",
-    "it would be better",
-    "i suggest",
     "you should consider",
+    "i suggest",
+    "it would be better",
     "for better safety",
     "to be safe",
     "just in case",
-    "potentially",
-    "possibly",
-    "arguably",
-    "you might",
-    "it might be",
-    "could be improved",
     "would recommend",
-    "best practice",
     "generally speaking",
 ]
 
@@ -218,8 +257,6 @@ FALSE_POSITIVE_PATTERNS = [
     # "infinite loop" claims without proof are almost always wrong
     ("infinite loop", None, "error"),
     ("infinite re-render", None, "error"),
-    # "memory leak" claims require proof of missing cleanup
-    ("memory leak", None, "error"),
     # setState in useEffect is not automatically an infinite loop
     ("setstate", "useeffect", "error"),
     ("set state", "useeffect", "error"),
@@ -275,22 +312,32 @@ def _is_hedging_comment(comment: ReviewComment) -> bool:
     return False
 
 
-def _filter_low_quality_comments(comments: list[ReviewComment]) -> list[ReviewComment]:
+def _filter_low_quality_comments(comments: list[ReviewComment], agent_name: str = "") -> list[ReviewComment]:
     """
     Remove comments that are hedging or match false positive patterns.
 
     Filters:
-    1. Hedging language (speculative phrasing)
+    1. Hedging language (advice-style phrasing)
     2. False positive ERROR patterns (context|null, infinite loop claims, etc.)
+
+    Note: Most hedging is handled by the moderator (downgrade ERROR → WARNING).
+    This filter only drops pure advice comments and known false positives.
     """
     filtered: list[ReviewComment] = []
+    hedging_dropped = 0
+    false_positive_dropped = 0
 
     for comment in comments:
         if _is_hedging_comment(comment):
+            hedging_dropped += 1
             continue
         if _is_false_positive_error(comment):
+            false_positive_dropped += 1
             continue
         filtered.append(comment)
+
+    if hedging_dropped > 0 or false_positive_dropped > 0:
+        print(f"[QuartzCouncil] 🔇 {agent_name} dropped: {hedging_dropped} hedging, {false_positive_dropped} false positive")
 
     return filtered
 
@@ -347,13 +394,10 @@ async def run_review_agent(
         for raw in result.comments
     ]
 
-    # Filter out low-quality comments (hedging + false positive patterns)
-    filtered_comments = _filter_low_quality_comments(comments)
-    filtered_count = len(comments) - len(filtered_comments)
-    if filtered_count > 0:
-        print(f"[QuartzCouncil] 🔇 {agent_name} filtered {filtered_count} low-quality comments")
+    # Filter out low-quality comments (advice-style hedging + false positive patterns)
+    filtered_comments = _filter_low_quality_comments(comments, agent_name)
 
-    print(f"[QuartzCouncil] 📊 {agent_name} returned {len(filtered_comments)} comments")
+    print(f"[QuartzCouncil] 📊 {agent_name} returned {len(filtered_comments)} comments (from {len(comments)} raw)")
     return (filtered_comments, False)
 
 

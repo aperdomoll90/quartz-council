@@ -113,13 +113,14 @@ def snap_to_nearest_valid_line(
     filename: str,
     line_number: int,
     file_line_map: dict[str, set[int]],
+    max_distance: int = 5,
 ) -> int | None:
     """
     Find the closest valid line number for a comment.
 
     If the exact line is valid, returns it unchanged.
-    Otherwise finds the nearest valid line (preferring earlier lines on ties).
-    Returns None if the file has no valid lines.
+    Otherwise finds the nearest valid line within max_distance.
+    Returns None if no valid line is close enough (to avoid misplaced comments).
     """
     valid_lines = file_line_map.get(filename)
     if not valid_lines:
@@ -129,16 +130,53 @@ def snap_to_nearest_valid_line(
     if line_number in valid_lines:
         return line_number
 
-    # Find the closest valid line
+    # Find the closest valid line within max_distance
     sorted_lines = sorted(valid_lines)
     best_line = None
     best_distance = float("inf")
 
     for valid_line in sorted_lines:
         distance = abs(valid_line - line_number)
-        # Prefer earlier lines on equal distance (< not <=)
-        if distance < best_distance:
+        # Only consider lines within max_distance
+        if distance <= max_distance and distance < best_distance:
             best_distance = distance
             best_line = valid_line
 
     return best_line
+
+
+def extract_line_from_patch(patch: str, target_line: int) -> str | None:
+    """
+    Extract the source code at a specific line number from a patch.
+    Returns the line content without the diff prefix (+/- / ).
+    """
+    if not patch:
+        return None
+
+    current_new_line = 0
+    in_hunk = False
+
+    for line in patch.split("\n"):
+        hunk_match = HUNK_HEADER_RE.match(line)
+        if hunk_match:
+            current_new_line = int(hunk_match.group(1))
+            in_hunk = True
+            continue
+
+        if not in_hunk or not line:
+            continue
+
+        prefix = line[0] if line else ""
+
+        if prefix == "+":
+            if current_new_line == target_line:
+                return line[1:]  # Remove the + prefix
+            current_new_line += 1
+        elif prefix == "-":
+            pass  # Deletions don't have line numbers
+        elif prefix == " ":
+            if current_new_line == target_line:
+                return line[1:]  # Remove the space prefix
+            current_new_line += 1
+
+    return None

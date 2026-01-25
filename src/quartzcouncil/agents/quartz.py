@@ -6,8 +6,10 @@ from pydantic import BaseModel
 
 from quartzcouncil.core.types import ReviewComment, ReviewWarning
 from quartzcouncil.core.pr_models import PullRequestInput, PullRequestFile
+from quartzcouncil.core.config_models import QuartzCouncilConfig
 from quartzcouncil.agents.amethyst import review_amethyst
 from quartzcouncil.agents.citrine import review_citrine
+from quartzcouncil.agents.chalcedony import review_chalcedony
 
 
 # =============================================================================
@@ -234,6 +236,10 @@ def _deduplicate(comments: list[ReviewComment], max_comments: int = 20) -> list[
     Deduplicate overlapping or similar comments, preferring higher severity.
     Limits total comments to avoid noisy reviews.
 
+    Args:
+        comments: List of comments to deduplicate
+        max_comments: Maximum comments to keep. 0 means no limit (keep all unique).
+
     Deduplication checks:
     1. Location-based: same file + overlapping lines
     2. Content-based: same file + similar message keywords
@@ -249,7 +255,8 @@ def _deduplicate(comments: list[ReviewComment], max_comments: int = 20) -> list[
     for comment in sorted_comments:
         if not _is_duplicate_comment(comment, kept):
             kept.append(comment)
-        if len(kept) >= max_comments:
+        # max_comments=0 means no limit
+        if max_comments > 0 and len(kept) >= max_comments:
             break
 
     return kept
@@ -313,6 +320,7 @@ def _generate_summary(comments: list[ReviewComment], warnings: list[ReviewWarnin
 
 async def review_council(
     pr: PullRequestInput,
+    cfg: QuartzCouncilConfig | None = None,
     max_comments: int = 20,
 ) -> CouncilReview:
     """
@@ -320,6 +328,18 @@ async def review_council(
 
     Routes files to relevant agents, executes in parallel, deduplicates
     overlapping comments, and generates a summary.
+
+    Chalcedony (repo conventions) is processed separately from Amethyst/Citrine:
+    - Amethyst + Citrine: sanitized, deduplicated, capped at max_comments
+    - Chalcedony: deduplicated separately, capped by config limits, appended after
+
+    This ensures repo-specific convention comments are never dropped in favor of
+    bug/type comments - they serve different purposes and shouldn't compete.
+
+    Args:
+        pr: Pull request input with files and patches
+        cfg: Optional repo config for Chalcedony agent (if None, Chalcedony is skipped)
+        max_comments: Maximum comments for Amethyst+Citrine (Chalcedony has its own limit)
     """
     # Route files to agents based on extension
     # Currently permissive - both agents see JS/TS files
@@ -343,35 +363,74 @@ async def review_council(
         head_sha=pr.head_sha,
     )
 
-    # Run agents in parallel (only if they have files to review)
-    tasks = []
+    # ==========================================================================
+    # RUN CORE AGENTS (Amethyst + Citrine) - bug/type detection
+    # ==========================================================================
+    core_tasks = []
     if amethyst_files:
-        tasks.append(review_amethyst(amethyst_pr))
+        core_tasks.append(review_amethyst(amethyst_pr))
     if citrine_files:
-        tasks.append(review_citrine(citrine_pr))
+        core_tasks.append(review_citrine(citrine_pr))
 
-    if not tasks:
-        # No reviewable files - return empty review
+    # ==========================================================================
+    # RUN CHALCEDONY SEPARATELY - repo conventions (if config exists)
+    # ==========================================================================
+    chalcedony_task = None
+    chalcedony_max_comments = 0  # default: 0 = uncapped (report all violations)
+    if cfg is not None and cfg.has_any_rules():
+        chalcedony_task = review_chalcedony(pr, cfg)
+        chalcedony_max_comments = cfg.limits.max_comments
+
+    # No agents to run at all
+    if not core_tasks and chalcedony_task is None:
         return CouncilReview(
             comments=[],
             warnings=[],
             summary="No reviewable files found (no .ts, .tsx, .js, .jsx files in this PR).",
         )
 
-    results = await asyncio.gather(*tasks)
+    # Run all agents in parallel
+    all_tasks = core_tasks + ([chalcedony_task] if chalcedony_task else [])
+    results = await asyncio.gather(*all_tasks)
 
-    all_comments: list[ReviewComment] = []
+    # Split results: core agents vs chalcedony
+    core_results = results[:len(core_tasks)]
+    chalcedony_result = results[len(core_tasks)] if chalcedony_task else None
+
+    # ==========================================================================
+    # PROCESS CORE COMMENTS (Amethyst + Citrine)
+    # ==========================================================================
+    core_comments: list[ReviewComment] = []
     all_warnings: list[ReviewWarning] = []
 
-    for agent_result in results:
-        all_comments.extend(agent_result.comments)
+    for agent_result in core_results:
+        core_comments.extend(agent_result.comments)
         all_warnings.extend(agent_result.warnings)
 
-    # Moderator sanity gate: enforce quality rules BEFORE deduplication
-    # This ensures hedging errors become warnings and false positives are dropped
-    sanitized_comments = _sanitize_comments(all_comments)
+    # Moderator sanity gate for core agents
+    sanitized_core = _sanitize_comments(core_comments)
+    final_core = _deduplicate(sanitized_core, max_comments=max_comments)
 
-    final_comments = _deduplicate(sanitized_comments, max_comments=max_comments)
+    # ==========================================================================
+    # PROCESS CHALCEDONY COMMENTS (separately)
+    # ==========================================================================
+    final_chalcedony: list[ReviewComment] = []
+
+    if chalcedony_result:
+        all_warnings.extend(chalcedony_result.warnings)
+
+        # Chalcedony gets its own deduplication (within itself only)
+        # No sanitization - repo rules are explicit, not speculative
+        chalcedony_comments = chalcedony_result.comments
+        final_chalcedony = _deduplicate(chalcedony_comments, max_comments=chalcedony_max_comments)
+
+        if final_chalcedony:
+            print(f"[QuartzCouncil] 💎 Chalcedony: {len(final_chalcedony)} convention comments (separate from core)")
+
+    # ==========================================================================
+    # COMBINE: core comments first, then chalcedony appended
+    # ==========================================================================
+    final_comments = final_core + final_chalcedony
     summary = _generate_summary(final_comments, all_warnings)
 
     return CouncilReview(comments=final_comments, warnings=all_warnings, summary=summary)

@@ -2,6 +2,7 @@ import os
 import hmac
 import hashlib
 import traceback
+import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
 
@@ -10,6 +11,7 @@ from quartzcouncil.github.pr import fetch_pr_files
 from quartzcouncil.github.client.github_client import GitHubClient
 from quartzcouncil.github.client.pr_api import fetch_pr_head_sha, find_existing_quartz_review, post_issue_comment
 from quartzcouncil.github.client.review_publisher import create_pr_review
+from quartzcouncil.github.client.config_api import fetch_quartzcouncil_config
 from quartzcouncil.core.pr_models import PullRequestInput, PullRequestFile
 from quartzcouncil.core.rate_limit import check_rate_limit, record_review, get_retry_after
 from quartzcouncil.agents.quartz import review_council
@@ -17,6 +19,17 @@ from quartzcouncil.agents.quartz import review_council
 load_dotenv()
 
 app = FastAPI()
+
+# =============================================================================
+# IN-PROGRESS REVIEW TRACKING
+# =============================================================================
+# Prevents race conditions when multiple webhook deliveries arrive before
+# the first review is published. The idempotency check queries GitHub for
+# existing reviews, but if the review hasn't been posted yet, duplicates slip through.
+# =============================================================================
+
+_reviews_in_progress: set[str] = set()
+_reviews_lock = asyncio.Lock()
 
 @app.get("/health")
 def health():
@@ -66,12 +79,28 @@ async def github_webhook(request: Request):
     # Only trigger on explicit command in PR conversation
     if event == "issue_comment" and payload.get("action") == "created":
         if _is_pr_issue_comment(payload) and _is_quartz_review_command(payload):
-            try:
-                repo_full = payload["repository"]["full_name"]
-                owner, repo_name = repo_full.split("/")
+            repo_full = payload["repository"]["full_name"]
+            owner, repo_name = repo_full.split("/")
+            pr_number = int(payload["issue"]["number"])
+            pr_key = f"{owner}/{repo_name}#{pr_number}"
 
+            # Acquire lock FIRST to prevent parallel processing of same PR
+            # NOTE: This only works within a single process. Multiple workers or restarts
+            # will not share this state. For production, use Redis or database.
+            async with _reviews_lock:
+                if pr_key in _reviews_in_progress:
+                    print(f"[QuartzCouncil] ⏭️ Review already in progress: {pr_key}")
+                    return {
+                        "ok": True,
+                        "triggered": True,
+                        "skipped": True,
+                        "reason": "in_progress",
+                    }
+                _reviews_in_progress.add(pr_key)
+                print(f"[QuartzCouncil] 🔒 Acquired lock for: {pr_key}")
+
+            try:
                 installation_id = int(payload["installation"]["id"])
-                pr_number = int(payload["issue"]["number"])
                 title = payload["issue"]["title"]
 
                 # Check rate limit before processing
@@ -91,7 +120,7 @@ async def github_webhook(request: Request):
                 token = await get_installation_token(installation_id)
                 gh = GitHubClient(token)
 
-                # Fetch head SHA first for idempotency check
+                # Fetch head SHA for idempotency check and review posting
                 head_sha = await fetch_pr_head_sha(owner, repo_name, pr_number, gh)
 
                 # Check if we already reviewed this commit (skip if disabled for testing)
@@ -125,8 +154,11 @@ async def github_webhook(request: Request):
 
                 pr_input = PullRequestInput(number=pr_number, title=title, files=files)
 
+                # Fetch repo config for Chalcedony agent (optional - None if not found)
+                repo_config = await fetch_quartzcouncil_config(owner, repo_name, head_sha, gh)
+
                 print(f"[QuartzCouncil] 🤖 Running council on {len(files)} patched files...")
-                review = await review_council(pr_input)
+                review = await review_council(pr_input, cfg=repo_config)
 
                 print("[QuartzCouncil] ✅ COUNCIL SUMMARY\n" + review.summary)
                 print(f"[QuartzCouncil] ✅ COMMENTS: {len(review.comments)}")
@@ -168,6 +200,11 @@ async def github_webhook(request: Request):
                     pass  # Don't fail if we can't post the error comment
 
                 return {"ok": False, "triggered": True, "error": str(error)}
+
+            finally:
+                # Always remove from in-progress set
+                async with _reviews_lock:
+                    _reviews_in_progress.discard(pr_key)
 
     # Default: ignore
     return {"ok": True, "triggered": False}

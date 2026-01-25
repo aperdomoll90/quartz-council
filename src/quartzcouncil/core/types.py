@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
-AgentName = Literal["Amethyst", "Citrine"]  # Future: Rutile, Smoky, Onyx, Chalcedony, Agate, Phantom, Rose
+AgentName = Literal["Amethyst", "Citrine", "Chalcedony"]  # Future: Rutile, Smoky, Onyx, Agate, Phantom, Rose
 Severity = Literal["info", "warning", "error"]
 Category = Literal["types", "perf", "arch", "consistency", "ui", "a11y", "security", "ux"]
 
