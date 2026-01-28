@@ -6,6 +6,27 @@ An opt-in, on-demand AI pull request reviewer that runs only when explicitly req
 
 QuartzCouncil is a GitHub App backend that provides AI-powered code review using a multi-agent "review council" architecture. It is **not** an automatic reviewer — it never runs unless a developer explicitly triggers it.
 
+## Architecture
+
+**Type:** Stateless webhook server (event-driven microservice)
+
+```
+GitHub → Webhook POST → FastAPI → Agents (parallel) → GitHub API
+```
+
+| Component | Technology | Purpose |
+|-----------|------------|---------|
+| Web framework | FastAPI + uvicorn | Async HTTP server for webhooks |
+| LLM orchestration | LangChain + OpenAI | Structured output from GPT models |
+| HTTP client | httpx | Async calls to GitHub/OpenAI APIs |
+| Validation | Pydantic | Request/response schemas, LLM output parsing |
+| Auth | PyJWT | GitHub App JWT + installation tokens |
+
+**Stateless design:**
+- No database (rate limiting is in-memory, resets on restart)
+- No user sessions (GitHub App handles auth)
+- Single process (use Redis for shared state if scaling horizontally)
+
 ## How It Works
 
 ### Triggering a Review
