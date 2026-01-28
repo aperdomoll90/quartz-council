@@ -4,7 +4,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from quartzcouncil.core.types import ReviewComment, ReviewWarning
+from quartzcouncil.core.types import ReviewComment, ReviewWarning, ReviewMeta, TokenUsage
 from quartzcouncil.core.pr_models import PullRequestInput, PullRequestFile
 from quartzcouncil.core.config_models import QuartzCouncilConfig
 from quartzcouncil.agents.amethyst import review_amethyst
@@ -52,6 +52,7 @@ class CouncilReview(BaseModel):
     comments: list[ReviewComment]
     warnings: list[ReviewWarning]
     summary: str
+    meta: ReviewMeta = ReviewMeta()
 
 
 # =============================================================================
@@ -363,7 +364,28 @@ def _deduplicate(
     return kept
 
 
-def _generate_summary(comments: list[ReviewComment], warnings: list[ReviewWarning]) -> str:
+def _format_usage_stats(meta: ReviewMeta) -> str:
+    """Format usage statistics for the summary."""
+    import os
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    cost = meta.total_cost_usd(model)
+
+    parts = [
+        f"**Usage:** {meta.total_tokens:,} tokens",
+        f"(~${cost:.4f})",
+    ]
+
+    if meta.triggered_by:
+        parts.append(f"| Triggered by @{meta.triggered_by}")
+
+    return " ".join(parts)
+
+
+def _generate_summary(
+    comments: list[ReviewComment],
+    warnings: list[ReviewWarning],
+    meta: ReviewMeta | None = None,
+) -> str:
     """Generate a summary of the review, including any warnings about skipped content."""
     lines: list[str] = []
 
@@ -379,6 +401,9 @@ def _generate_summary(comments: list[ReviewComment], warnings: list[ReviewWarnin
 
     if not comments:
         lines.append("No issues found. The code looks good.")
+        if meta and meta.total_tokens > 0:
+            lines.append("")
+            lines.append(_format_usage_stats(meta))
         return "\n".join(lines)
 
     error_count = sum(1 for comment in comments if comment.severity == "error")
@@ -416,6 +441,11 @@ def _generate_summary(comments: list[ReviewComment], warnings: list[ReviewWarnin
         for error in error_comments[:3]:
             lines.append(f"- [{error.file}:{error.line_start}] {error.message[:80]}...")
 
+    # Add usage stats at the end
+    if meta and meta.total_tokens > 0:
+        lines.append("")
+        lines.append(_format_usage_stats(meta))
+
     return "\n".join(lines)
 
 
@@ -423,6 +453,8 @@ async def review_council(
     pr: PullRequestInput,
     cfg: QuartzCouncilConfig | None = None,
     max_comments: int = 20,
+    triggered_by: str | None = None,
+    triggered_by_id: int | None = None,
 ) -> CouncilReview:
     """
     Run the Quartz council review.
@@ -441,6 +473,8 @@ async def review_council(
         pr: Pull request input with files and patches
         cfg: Optional repo config for Chalcedony agent (if None, Chalcedony is skipped)
         max_comments: Maximum distinct locations for Amethyst+Citrine (default 20)
+        triggered_by: GitHub username of the person who triggered the review
+        triggered_by_id: GitHub user ID of the person who triggered the review
     """
     # Route files to agents based on extension
     # Currently permissive - both agents see JS/TS files
@@ -489,6 +523,7 @@ async def review_council(
             comments=[],
             warnings=[],
             summary="No reviewable files found (no .ts, .tsx, .js, .jsx files in this PR).",
+            meta=ReviewMeta(triggered_by=triggered_by, triggered_by_id=triggered_by_id),
         )
 
     # Run all agents in parallel
@@ -549,6 +584,22 @@ async def review_council(
     # COMBINE: core comments first, then chalcedony appended
     # ==========================================================================
     final_comments = final_core + final_chalcedony
-    summary = _generate_summary(final_comments, all_warnings)
 
-    return CouncilReview(comments=final_comments, warnings=all_warnings, summary=summary)
+    # ==========================================================================
+    # AGGREGATE TOKEN USAGE from all agents
+    # ==========================================================================
+    all_token_usage: list[TokenUsage] = []
+    for agent_result in core_results:
+        all_token_usage.extend(agent_result.token_usage)
+    if chalcedony_result:
+        all_token_usage.extend(chalcedony_result.token_usage)
+
+    meta = ReviewMeta(
+        triggered_by=triggered_by,
+        triggered_by_id=triggered_by_id,
+        token_usage=all_token_usage,
+    )
+
+    summary = _generate_summary(final_comments, all_warnings, meta)
+
+    return CouncilReview(comments=final_comments, warnings=all_warnings, summary=summary, meta=meta)

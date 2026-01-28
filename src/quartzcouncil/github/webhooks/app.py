@@ -103,6 +103,11 @@ async def github_webhook(request: Request):
                 installation_id = int(payload["installation"]["id"])
                 title = payload["issue"]["title"]
 
+                # Extract user who triggered the review
+                comment_user = payload.get("comment", {}).get("user", {})
+                triggered_by = comment_user.get("login")
+                triggered_by_id = comment_user.get("id")
+
                 # Check rate limit before processing
                 allowed, remaining = check_rate_limit(installation_id)
                 if not allowed:
@@ -157,11 +162,22 @@ async def github_webhook(request: Request):
                 # Fetch repo config for Chalcedony agent (optional - None if not found)
                 repo_config = await fetch_quartzcouncil_config(owner, repo_name, head_sha, gh)
 
-                print(f"[QuartzCouncil] 🤖 Running council on {len(files)} patched files...")
-                review = await review_council(pr_input, cfg=repo_config)
+                print(f"[QuartzCouncil] 🤖 Running council on {len(files)} patched files... (triggered by @{triggered_by})")
+                review = await review_council(
+                    pr_input,
+                    cfg=repo_config,
+                    triggered_by=triggered_by,
+                    triggered_by_id=triggered_by_id,
+                )
 
                 print("[QuartzCouncil] ✅ COUNCIL SUMMARY\n" + review.summary)
                 print(f"[QuartzCouncil] ✅ COMMENTS: {len(review.comments)}")
+
+                # Log token usage
+                if review.meta.total_tokens > 0:
+                    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+                    cost = review.meta.total_cost_usd(model)
+                    print(f"[QuartzCouncil] 📊 TOKEN USAGE: {review.meta.total_tokens:,} tokens (~${cost:.4f})")
                 for comment in review.comments:
                     print(f"[QuartzCouncil] [{comment.agent}] {comment.file}:{comment.line_start}-{comment.line_end} {comment.severity} {comment.category} — {comment.message}")
 

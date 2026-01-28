@@ -7,7 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from openai import LengthFinishReasonError
 from pydantic import BaseModel
 
-from quartzcouncil.core.types import RawComment, ReviewComment, ReviewWarning, AgentName
+from quartzcouncil.core.types import RawComment, ReviewComment, ReviewWarning, AgentName, TokenUsage
 from quartzcouncil.core.pr_models import PullRequestInput, PullRequestFile
 
 
@@ -15,6 +15,7 @@ class AgentResult(BaseModel):
     """Result from an agent run, including comments and any warnings."""
     comments: list[ReviewComment]
     warnings: list[ReviewWarning]
+    token_usage: list[TokenUsage] = []
 
 
 # =============================================================================
@@ -358,19 +359,36 @@ async def run_review_agent(
     pr: PullRequestInput,
     agent_name: AgentName,
     prompt: ChatPromptTemplate,
-) -> tuple[list[ReviewComment], bool]:
+    batch_index: int = 0,
+) -> tuple[list[ReviewComment], bool, TokenUsage]:
     """
     Shared execution logic for review agents (single batch).
 
     LLM outputs RawComment (no agent), we inject agent deterministically.
-    Catches LengthFinishReasonError and returns ([], True) on failure.
+    Catches LengthFinishReasonError and returns ([], True, usage) on failure.
 
     Uses a content-based seed for reproducibility: same diff content
     produces same LLM output (best effort, not guaranteed by OpenAI).
 
     Returns:
-        Tuple of (comments, failed) where failed=True if output limit was hit.
+        Tuple of (comments, failed, token_usage) where failed=True if output limit was hit.
     """
+    from langchain_core.callbacks import BaseCallbackHandler
+
+    # Token tracking callback
+    class TokenTracker(BaseCallbackHandler):
+        def __init__(self):
+            self.input_tokens = 0
+            self.output_tokens = 0
+
+        def on_llm_end(self, response, **kwargs):
+            if hasattr(response, "llm_output") and response.llm_output:
+                usage = response.llm_output.get("token_usage", {})
+                self.input_tokens = usage.get("prompt_tokens", 0)
+                self.output_tokens = usage.get("completion_tokens", 0)
+
+    tracker = TokenTracker()
+
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     temperature = float(os.getenv("OPENAI_TEMPERATURE", "0"))
 
@@ -383,12 +401,23 @@ async def run_review_agent(
     chain = prompt | structured_llm
 
     try:
-        result: AgentOutput = await chain.ainvoke({
-            "diff": diff_content
-        })
+        result: AgentOutput = await chain.ainvoke(
+            {"diff": diff_content},
+            config={"callbacks": [tracker]},
+        )
     except LengthFinishReasonError:
         print(f"[QuartzCouncil] ⚠️ {agent_name} hit output limit, batch failed")
-        return ([], True)
+        empty_usage = TokenUsage(agent=agent_name, batch_index=batch_index)
+        return ([], True, empty_usage)
+
+    # Capture token usage
+    usage = TokenUsage(
+        input_tokens=tracker.input_tokens,
+        output_tokens=tracker.output_tokens,
+        total_tokens=tracker.input_tokens + tracker.output_tokens,
+        agent=agent_name,
+        batch_index=batch_index,
+    )
 
     # Inject agent name in code — not from LLM
     comments = [
@@ -399,8 +428,9 @@ async def run_review_agent(
     # Filter out low-quality comments (advice-style hedging + false positive patterns)
     filtered_comments = _filter_low_quality_comments(comments, agent_name)
 
-    print(f"[QuartzCouncil] 📊 {agent_name} returned {len(filtered_comments)} comments (from {len(comments)} raw)")
-    return (filtered_comments, False)
+    token_info = f" ({usage.total_tokens} tokens)" if usage.total_tokens > 0 else ""
+    print(f"[QuartzCouncil] 📊 {agent_name} returned {len(filtered_comments)} comments (from {len(comments)} raw){token_info}")
+    return (filtered_comments, False, usage)
 
 
 MAX_BATCHES_PER_AGENT = 5  # Cap batches to limit API costs
@@ -451,6 +481,7 @@ async def run_review_agent_batched(
         print(f"[QuartzCouncil] 📦 {agent_name} processing {len(batches)} batches...")
 
     all_comments: list[ReviewComment] = []
+    all_token_usage: list[TokenUsage] = []
 
     for batch_index, batch_files in enumerate(batches):
         batch_pr = PullRequestInput(
@@ -464,8 +495,9 @@ async def run_review_agent_batched(
         if len(batches) > 1:
             print(f"[QuartzCouncil] 📦 {agent_name} batch {batch_index + 1}/{len(batches)} ({len(batch_files)} files)")
 
-        comments, batch_failed = await run_review_agent(batch_pr, agent_name, prompt)
+        comments, batch_failed, usage = await run_review_agent(batch_pr, agent_name, prompt, batch_index)
         all_comments.extend(comments)
+        all_token_usage.append(usage)
 
         if batch_failed:
             file_names = [f.filename for f in batch_files]
@@ -474,4 +506,4 @@ async def run_review_agent_batched(
                 message=f"Output limit hit, batch partially reviewed: {', '.join(file_names[:3])}{'...' if len(file_names) > 3 else ''}",
             ))
 
-    return AgentResult(comments=all_comments, warnings=warnings)
+    return AgentResult(comments=all_comments, warnings=warnings, token_usage=all_token_usage)

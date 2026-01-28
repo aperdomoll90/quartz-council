@@ -123,7 +123,7 @@ src/quartzcouncil/
 │   ├── chalcedony.py  # Repo conventions reviewer
 │   └── quartz.py      # Moderator (parallel exec, dedupe, summary)
 ├── core/
-│   ├── types.py         # RawComment, ReviewComment, ReviewWarning
+│   ├── types.py         # RawComment, ReviewComment, ReviewWarning, TokenUsage, ReviewMeta
 │   ├── pr_models.py     # PullRequestInput, PullRequestFile
 │   ├── config_models.py # QuartzCouncilConfig, RuleToggles, PolicyRule
 │   └── rate_limit.py    # In-memory rate limiter
@@ -166,6 +166,8 @@ src/quartzcouncil/
 - Small PR (10 files): ~$0.01
 - Medium PR (50 files): ~$0.05
 - Huge PR (200 files): ~$0.05 (capped at 5 batches)
+
+**Token tracking:** Each review reports total tokens used and estimated cost in the summary, along with who triggered the review (`@username`).
 
 ## Security Controls
 
