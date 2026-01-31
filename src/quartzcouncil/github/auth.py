@@ -8,9 +8,20 @@ import jwt
 
 
 def _read_private_key() -> str:
+    """
+    Read GitHub App private key from either:
+    1. GITHUB_PRIVATE_KEY_PEM env var (direct PEM content, used in Lambda)
+    2. GITHUB_PRIVATE_KEY_PATH env var (file path, used in local dev)
+    """
+    # First check for direct PEM content (Lambda / Secrets Manager)
+    pem_content = os.getenv("GITHUB_PRIVATE_KEY_PEM", "")
+    if pem_content:
+        return pem_content
+
+    # Fall back to file path (local development)
     path = os.getenv("GITHUB_PRIVATE_KEY_PATH", "")
     if not path:
-        raise RuntimeError("Missing GITHUB_PRIVATE_KEY_PATH")
+        raise RuntimeError("Missing GITHUB_PRIVATE_KEY_PEM or GITHUB_PRIVATE_KEY_PATH")
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 

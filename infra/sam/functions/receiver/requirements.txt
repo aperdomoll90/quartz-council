@@ -1,0 +1,2 @@
+# Receiver Lambda has minimal dependencies
+# boto3 is provided by Lambda runtime

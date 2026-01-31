@@ -5,18 +5,16 @@ description = "Opt-in AI pull request reviewer with multi-agent review council"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.128.0",
-    "httpx>=0.28.1",
-    "langchain>=1.2.6",
-    "langchain-openai>=1.1.7",
-    "openai>=2.15.0",
-    "pydantic>=2.12.5",
-    "pygithub>=2.8.1",
-    "pyjwt>=2.10.1",
-    "python-dotenv>=1.2.1",
-    "pyyaml>=6.0.2",
-    "streamlit>=1.53.0",
-    "uvicorn>=0.40.0",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "openai>=1.50.0",
+    "pydantic>=2.9.0",
+    "pyjwt>=2.9.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.0",
+    "uvicorn>=0.32.0",
 ]
 
 [dependency-groups]

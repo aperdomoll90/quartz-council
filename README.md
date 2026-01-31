@@ -121,6 +121,46 @@ https://abc123.ngrok-free.app/github/webhook
 
 Note: ngrok requires a free account. Run `ngrok config add-authtoken <token>` after signing up.
 
+## Production Deployment (AWS Lambda)
+
+QuartzCouncil can be deployed to AWS Lambda for production use.
+
+### Architecture
+
+```
+GitHub → API Gateway → Receiver Lambda → SQS → Worker Lambda → GitHub API
+```
+
+- **Receiver Lambda**: Verifies webhook, enqueues job, returns 200 immediately
+- **Worker Lambda**: Processes review (30-60s), posts to GitHub
+- **SQS**: Decouples webhook response from processing
+- **DynamoDB**: Idempotency store (prevents duplicate reviews)
+
+### Deploy
+
+```bash
+cd infra/sam
+
+# Prepare and build
+./build.sh
+sam build
+
+# Deploy (first time)
+sam deploy --guided
+
+# Set secrets
+aws secretsmanager put-secret-value --region us-east-1 \
+  --secret-id quartzcouncil/openai_api_key --secret-string "sk-..."
+aws secretsmanager put-secret-value --region us-east-1 \
+  --secret-id quartzcouncil/github_webhook_secret --secret-string "..."
+aws secretsmanager put-secret-value --region us-east-1 \
+  --secret-id quartzcouncil/github_app_id --secret-string "123456"
+aws secretsmanager put-secret-value --region us-east-1 \
+  --secret-id quartzcouncil/github_private_key_pem --secret-string "$(cat key.pem)"
+```
+
+Update your GitHub App webhook URL to the API Gateway endpoint from the deploy output.
+
 ## Environment Variables
 
 | Variable | Default | Description |
