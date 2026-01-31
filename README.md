@@ -348,6 +348,28 @@ policy:
 
 Chalcedony ONLY enforces rules defined in the config — it never invents or suggests improvements beyond what's specified.
 
+## Scripts
+
+### List Installations
+
+See which accounts have installed your GitHub App:
+
+```bash
+uv run python scripts/list_installations.py
+```
+
+Output:
+```
+Found 1 installation(s):
+
+------------------------------------------------------------
+  User: aperdomoll90
+  Installation ID: 105484991
+  Created: 2026-01-22T04:17:41.000Z
+  Repos: Selected repositories only
+------------------------------------------------------------
+```
+
 ## Roadmap
 
 ### Future Triggers
