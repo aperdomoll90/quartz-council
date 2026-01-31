@@ -1,10 +1,17 @@
-import sys
-from pathlib import Path
-
-# Add src/ to Python path so imports work without packaging
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
+import os
 import uvicorn
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def main() -> None:
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(
+        "quartzcouncil.github.webhooks.app:app",
+        host="0.0.0.0",
+        port=port,
+        reload=True,
+    )
 
 if __name__ == "__main__":
-    uvicorn.run("quartzcouncil.github.webhooks.app:app", host="0.0.0.0", port=8000, reload=True)
+    main()

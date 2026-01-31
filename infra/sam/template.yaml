@@ -1,0 +1,150 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: QuartzCouncil - GitHub App PR reviewer (Receiver + SQS + Worker)
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Architectures: [x86_64]
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+
+Resources:
+  # ----------------------------
+  # Queue
+  # ----------------------------
+  ReviewQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 300  # must be >= Worker timeout
+
+  # ----------------------------
+  # Idempotency store (prevents duplicate reviews)
+  # ----------------------------
+  DeliveryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: delivery_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: delivery_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ----------------------------
+  # Shared dependencies layer
+  # ----------------------------
+  QuartzCouncilLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: quartzcouncil-deps
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.9
+    Metadata:
+      BuildMethod: makefile
+
+  # ----------------------------
+  # Receiver Lambda (Webhook)
+  # ----------------------------
+  ReceiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/receiver/
+      Handler: app.handler
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          REVIEW_QUEUE_URL: !Ref ReviewQueue
+          GITHUB_WEBHOOK_SECRET_ARN: !Ref GitHubWebhookSecret
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReviewQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref GitHubWebhookSecret
+      Events:
+        GithubWebhook:
+          Type: Api
+          Properties:
+            Path: /github/webhook
+            Method: POST
+
+  # ----------------------------
+  # Worker Lambda (Runs council)
+  # ----------------------------
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/worker/
+      Handler: app.handler
+      Timeout: 180
+      MemorySize: 1024
+      Layers:
+        - !Ref QuartzCouncilLayer
+      Environment:
+        Variables:
+          OPENAI_API_KEY_ARN: !Ref OpenAISecret
+          GITHUB_APP_ID_ARN: !Ref GitHubAppIdSecret
+          GITHUB_PRIVATE_KEY_ARN: !Ref GitHubPrivateKeySecret
+          DELIVERY_TABLE: !Ref DeliveryTable
+          OPENAI_MODEL: gpt-4o-mini
+          OPENAI_TEMPERATURE: "0"
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ReviewQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref OpenAISecret
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref GitHubAppIdSecret
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref GitHubPrivateKeySecret
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeliveryTable
+      Events:
+        ReviewQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReviewQueue.Arn
+            BatchSize: 1
+
+  # ----------------------------
+  # Secrets Manager secrets
+  # ----------------------------
+  GitHubWebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: quartzcouncil/github_webhook_secret
+
+  OpenAISecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: quartzcouncil/openai_api_key
+
+  GitHubAppIdSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: quartzcouncil/github_app_id
+
+  GitHubPrivateKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: quartzcouncil/github_private_key_pem
+
+Outputs:
+  ApiBaseUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  WebhookUrl:
+    Description: GitHub App webhook URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/github/webhook"
+  ReviewQueueUrl:
+    Description: SQS queue URL for review jobs
+    Value: !Ref ReviewQueue

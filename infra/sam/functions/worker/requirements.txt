@@ -1,0 +1,2 @@
+# Worker Lambda dependencies come from the QuartzCouncilLayer
+# boto3 is provided by Lambda runtime

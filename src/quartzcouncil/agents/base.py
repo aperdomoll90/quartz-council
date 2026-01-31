@@ -1,12 +1,33 @@
 from __future__ import annotations
+import hashlib
 import os
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+from openai import LengthFinishReasonError
 from pydantic import BaseModel
 
-from quartzcouncil.core.types import RawComment, ReviewComment, AgentName
-from quartzcouncil.core.pr_models import PullRequestInput
+from quartzcouncil.core.types import RawComment, ReviewComment, ReviewWarning, AgentName, TokenUsage
+from quartzcouncil.core.pr_models import PullRequestInput, PullRequestFile
+
+
+class AgentResult(BaseModel):
+    """Result from an agent run, including comments and any warnings."""
+    comments: list[ReviewComment]
+    warnings: list[ReviewWarning]
+    token_usage: list[TokenUsage] = []
+
+
+# =============================================================================
+# CHUNKING CONFIGURATION
+# =============================================================================
+# Large PRs are split into batches to avoid token limit errors.
+# gpt-4o-mini has 16K output limit, so we keep batches small.
+# =============================================================================
+
+MAX_CHARS_PER_BATCH = 40_000  # Character budget per batch
+MAX_FILES_PER_BATCH = 12      # Max files per batch
+MAX_PATCH_SIZE = 60_000       # Skip patches larger than this (likely generated/minified)
 
 
 class AgentOutput(BaseModel):
@@ -14,38 +35,475 @@ class AgentOutput(BaseModel):
     comments: list[RawComment]
 
 
+def _add_line_numbers_to_patch(patch: str) -> str:
+    """
+    Add explicit line numbers to patch for easier LLM parsing.
+    Transforms raw diff into numbered format showing new-file line numbers.
+    """
+    if not patch:
+        return patch
+
+    import re
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+    result_lines = []
+    current_line = 0
+    in_hunk = False
+
+    for line in patch.split("\n"):
+        hunk_match = hunk_re.match(line)
+        if hunk_match:
+            current_line = int(hunk_match.group(1))
+            in_hunk = True
+            result_lines.append(line)
+            continue
+
+        if not in_hunk:
+            result_lines.append(line)
+            continue
+
+        if not line:
+            result_lines.append(line)
+            continue
+
+        prefix = line[0] if line else ""
+
+        if prefix == "+":
+            # Addition - show line number
+            result_lines.append(f"L{current_line:>4} {line}")
+            current_line += 1
+        elif prefix == "-":
+            # Deletion - no line number (doesn't exist in new file)
+            result_lines.append(f"      {line}")
+        elif prefix == " ":
+            # Context - show line number
+            result_lines.append(f"L{current_line:>4} {line}")
+            current_line += 1
+        else:
+            result_lines.append(line)
+
+    return "\n".join(result_lines)
+
+
 def build_diff(pr: PullRequestInput) -> str:
-    """Format PR files into a readable diff string."""
+    """Format PR files into a readable diff string with line numbers."""
     parts = []
     for pr_file in pr.files:
-        parts.append(f"\n--- FILE: {pr_file.filename} ---\n{pr_file.patch}")
+        numbered_patch = _add_line_numbers_to_patch(pr_file.patch)
+        parts.append(f"\n--- FILE: {pr_file.filename} ---\n{numbered_patch}")
     return "\n".join(parts)
+
+
+class ChunkResult(BaseModel):
+    """Result of chunking files into batches."""
+    batches: list[list[PullRequestFile]]
+    skipped_files: list[str]
+
+
+# =============================================================================
+# FILE PRIORITIZATION
+# =============================================================================
+# When batches are capped, we want to review the most important files first.
+# Priority order: components > hooks > pages > utils > tests > configs
+# =============================================================================
+
+def _get_file_priority(filepath: str) -> int:
+    """
+    Return priority score for a file (lower = higher priority).
+
+    Priority order:
+    0 - Components (likely user-facing, highest impact)
+    1 - Hooks (shared logic, high impact)
+    2 - Pages/routes (user-facing)
+    3 - Utils/helpers (shared code)
+    4 - Tests (important but lower risk)
+    5 - Config/generated (lowest priority)
+    """
+    filepath_lower = filepath.lower()
+    filename = filepath.rsplit('/', 1)[-1].lower() if '/' in filepath else filepath.lower()
+
+    # Config and generated files - lowest priority
+    if any(pattern in filepath_lower for pattern in [
+        "config", ".config.", "generated", ".gen.", "mock", "__mock__",
+        "package.json", "tsconfig", "eslint", "prettier", ".d.ts",
+    ]):
+        return 5
+
+    # Test files
+    if any(pattern in filepath_lower for pattern in [
+        ".test.", ".spec.", "__tests__", "/tests/", "/test/",
+    ]):
+        return 4
+
+    # Utils and helpers
+    if any(pattern in filepath_lower for pattern in [
+        "/utils/", "/util/", "/helpers/", "/helper/", "/lib/", "/services/",
+        "utils.", "helper.", "service.",
+    ]):
+        return 3
+
+    # Pages and routes
+    if any(pattern in filepath_lower for pattern in [
+        "/pages/", "/app/", "/routes/", "page.", "route.", "layout.",
+    ]):
+        return 2
+
+    # Hooks
+    if any(pattern in filepath_lower for pattern in [
+        "/hooks/", "/hook/", "use",
+    ]) and filename.startswith("use"):
+        return 1
+
+    # Components (default for .tsx files, or explicit component directories)
+    if any(pattern in filepath_lower for pattern in [
+        "/components/", "/component/", "component.",
+    ]) or filepath_lower.endswith(".tsx"):
+        return 0
+
+    # Default: treat as utils-level
+    return 3
+
+
+def _get_file_sort_key(filepath: str) -> tuple[int, str, str]:
+    """
+    Sort key for files: priority first, then directory, then filename.
+    This ensures high-priority files are batched first.
+    """
+    priority = _get_file_priority(filepath)
+    if '/' in filepath:
+        directory = filepath.rsplit('/', 1)[0]
+    else:
+        directory = ''
+    return (priority, directory, filepath)
+
+
+def chunk_files_by_char_budget(
+    files: list[PullRequestFile],
+    max_chars: int = MAX_CHARS_PER_BATCH,
+    max_files: int = MAX_FILES_PER_BATCH,
+) -> ChunkResult:
+    """
+    Split files into batches based on character budget.
+    Skips gigantic patches (likely generated/minified).
+    Returns both batches and list of skipped filenames.
+
+    Files are sorted by directory then filename before batching to ensure
+    deterministic batch composition and keep related files together.
+    """
+    batches: list[list[PullRequestFile]] = []
+    current_batch: list[PullRequestFile] = []
+    current_chars = 0
+    skipped_files: list[str] = []
+
+    # Sort by priority, then directory, then filename for deterministic batching
+    # This ensures high-priority files (components, hooks) are reviewed first
+    sorted_files = sorted(files, key=lambda pr_file: _get_file_sort_key(pr_file.filename))
+
+    for pr_file in sorted_files:
+        patch = pr_file.patch or ""
+        patch_size = len(patch)
+
+        # Skip gigantic patches (generated/minified files)
+        if patch_size > MAX_PATCH_SIZE:
+            print(f"[QuartzCouncil] ⏭️ Skipping large patch: {pr_file.filename} ({patch_size} chars)")
+            skipped_files.append(pr_file.filename)
+            continue
+
+        # Start new batch if current would exceed limits
+        if current_batch and (current_chars + patch_size > max_chars or len(current_batch) >= max_files):
+            batches.append(current_batch)
+            current_batch = []
+            current_chars = 0
+
+        current_batch.append(pr_file)
+        current_chars += patch_size
+
+    # Don't forget the last batch
+    if current_batch:
+        batches.append(current_batch)
+
+    return ChunkResult(batches=batches, skipped_files=skipped_files)
+
+
+# =============================================================================
+# HEDGING FILTER (SOFT)
+# =============================================================================
+# Most hedging is handled by the moderator (downgrade ERROR → WARNING).
+# Here we only drop the most egregious "advice-style" comments that add no value.
+# =============================================================================
+
+HEDGING_PHRASES = [
+    "consider ",
+    "might want to",
+    "you should consider",
+    "i suggest",
+    "it would be better",
+    "for better safety",
+    "to be safe",
+    "just in case",
+    "would recommend",
+    "generally speaking",
+]
+
+# =============================================================================
+# FALSE POSITIVE FILTERS
+# =============================================================================
+# These patterns catch common LLM mistakes that slip through prompt instructions.
+# Each filter targets a specific false positive pattern identified in testing.
+# =============================================================================
+
+FALSE_POSITIVE_PATTERNS = [
+    # REMOVED: ("context", "null", "error") - was filtering legitimate unsafe cast issues
+    # The LLM correctly identifies "return context as ContextType" as unsafe when context is T | null
+    # "infinite loop" claims without proof are almost always wrong
+    ("infinite loop", None, "error"),
+    ("infinite re-render", None, "error"),
+    # setState in useEffect is not automatically an infinite loop
+    ("setstate", "useeffect", "error"),
+    ("set state", "useeffect", "error"),
+    # REMOVED: "without checking" - was filtering legitimate array access and null check errors
+    # ("without checking", None, "error"),
+    # "can throw" / "can cause" is speculative
+    ("can throw", None, "error"),
+    ("can cause", None, "error"),
+]
+
+
+def _is_false_positive_error(comment: ReviewComment) -> bool:
+    """
+    Check if an ERROR-severity comment matches known false positive patterns.
+
+    These are patterns where the LLM commonly claims ERROR but the issue is
+    either not a bug or requires external context to determine.
+    """
+    if comment.severity != "error":
+        return False
+
+    message_lower = comment.message.lower()
+
+    for pattern in FALSE_POSITIVE_PATTERNS:
+        keyword1, keyword2, target_severity = pattern
+
+        # Only filter if targeting this severity
+        if target_severity != "error":
+            continue
+
+        # Check if pattern matches
+        if keyword1 in message_lower:
+            if keyword2 is None or keyword2 in message_lower:
+                return True
+
+    return False
+
+
+def _is_hedging_comment(comment: ReviewComment) -> bool:
+    """Check if a comment contains hedging language."""
+    message_lower = comment.message.lower()
+    suggestion_lower = (comment.suggestion or "").lower()
+    combined = message_lower + " " + suggestion_lower
+
+    for phrase in HEDGING_PHRASES:
+        if phrase in combined:
+            return True
+
+    # Also filter info-level comments (should never be used per prompts)
+    if comment.severity == "info":
+        return True
+
+    return False
+
+
+def _filter_low_quality_comments(comments: list[ReviewComment], agent_name: str = "") -> list[ReviewComment]:
+    """
+    Remove comments that are hedging or match false positive patterns.
+
+    Filters:
+    1. Hedging language (advice-style phrasing)
+    2. False positive ERROR patterns (context|null, infinite loop claims, etc.)
+
+    Note: Most hedging is handled by the moderator (downgrade ERROR → WARNING).
+    This filter only drops pure advice comments and known false positives.
+    """
+    filtered: list[ReviewComment] = []
+    hedging_dropped = 0
+    false_positive_dropped = 0
+
+    for comment in comments:
+        if _is_hedging_comment(comment):
+            hedging_dropped += 1
+            print(f"[QuartzCouncil] 🔇 {agent_name} DROPPED (hedging): {comment.file}:{comment.line_start} - {comment.message[:60]}...")
+            continue
+        if _is_false_positive_error(comment):
+            false_positive_dropped += 1
+            print(f"[QuartzCouncil] 🔇 {agent_name} DROPPED (false positive): {comment.file}:{comment.line_start} - {comment.message[:60]}...")
+            continue
+        filtered.append(comment)
+
+    if hedging_dropped > 0 or false_positive_dropped > 0:
+        print(f"[QuartzCouncil] 🔇 {agent_name} dropped: {hedging_dropped} hedging, {false_positive_dropped} false positive")
+
+    return filtered
+
+
+def _compute_content_seed(diff_content: str) -> int:
+    """
+    Compute a deterministic seed from diff content.
+    Same diff content always produces the same seed for reproducible LLM outputs.
+    """
+    content_hash = hashlib.sha256(diff_content.encode()).hexdigest()
+    # Take first 8 hex chars and convert to int (max ~4 billion, fits in seed range)
+    return int(content_hash[:8], 16)
 
 
 async def run_review_agent(
     pr: PullRequestInput,
     agent_name: AgentName,
     prompt: ChatPromptTemplate,
-) -> list[ReviewComment]:
+    batch_index: int = 0,
+) -> tuple[list[ReviewComment], bool, TokenUsage]:
     """
-    Shared execution logic for review agents.
+    Shared execution logic for review agents (single batch).
 
     LLM outputs RawComment (no agent), we inject agent deterministically.
-    """
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
+    Catches LengthFinishReasonError and returns ([], True, usage) on failure.
 
-    llm = ChatOpenAI(model=model, temperature=temperature)
+    Uses a content-based seed for reproducibility: same diff content
+    produces same LLM output (best effort, not guaranteed by OpenAI).
+
+    Returns:
+        Tuple of (comments, failed, token_usage) where failed=True if output limit was hit.
+    """
+    from langchain_core.callbacks import BaseCallbackHandler
+
+    # Token tracking callback
+    class TokenTracker(BaseCallbackHandler):
+        def __init__(self):
+            self.input_tokens = 0
+            self.output_tokens = 0
+
+        def on_llm_end(self, response, **kwargs):
+            if hasattr(response, "llm_output") and response.llm_output:
+                usage = response.llm_output.get("token_usage", {})
+                self.input_tokens = usage.get("prompt_tokens", 0)
+                self.output_tokens = usage.get("completion_tokens", 0)
+
+    tracker = TokenTracker()
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    temperature = float(os.getenv("OPENAI_TEMPERATURE", "0"))
+
+    diff_content = build_diff(pr)
+    content_seed = _compute_content_seed(diff_content)
+
+    llm = ChatOpenAI(model=model, temperature=temperature, seed=content_seed)
     structured_llm = llm.with_structured_output(AgentOutput)
 
     chain = prompt | structured_llm
 
-    result: AgentOutput = await chain.ainvoke({
-        "diff": build_diff(pr)
-    })
+    try:
+        result: AgentOutput = await chain.ainvoke(
+            {"diff": diff_content},
+            config={"callbacks": [tracker]},
+        )
+    except LengthFinishReasonError:
+        print(f"[QuartzCouncil] ⚠️ {agent_name} hit output limit, batch failed")
+        empty_usage = TokenUsage(agent=agent_name, batch_index=batch_index)
+        return ([], True, empty_usage)
+
+    # Capture token usage
+    usage = TokenUsage(
+        input_tokens=tracker.input_tokens,
+        output_tokens=tracker.output_tokens,
+        total_tokens=tracker.input_tokens + tracker.output_tokens,
+        agent=agent_name,
+        batch_index=batch_index,
+    )
 
     # Inject agent name in code — not from LLM
-    return [
+    comments = [
         ReviewComment(agent=agent_name, **raw.model_dump())
         for raw in result.comments
     ]
+
+    # Filter out low-quality comments (advice-style hedging + false positive patterns)
+    filtered_comments = _filter_low_quality_comments(comments, agent_name)
+
+    token_info = f" ({usage.total_tokens} tokens)" if usage.total_tokens > 0 else ""
+    print(f"[QuartzCouncil] 📊 {agent_name} returned {len(filtered_comments)} comments (from {len(comments)} raw){token_info}")
+    return (filtered_comments, False, usage)
+
+
+MAX_BATCHES_PER_AGENT = 5  # Cap batches to limit API costs
+
+
+async def run_review_agent_batched(
+    pr: PullRequestInput,
+    agent_name: AgentName,
+    prompt: ChatPromptTemplate,
+    max_chars: int = MAX_CHARS_PER_BATCH,
+    max_files: int = MAX_FILES_PER_BATCH,
+    max_batches: int = MAX_BATCHES_PER_AGENT,
+) -> AgentResult:
+    """
+    Run review agent on large PRs by chunking into batches.
+
+    Splits files by character budget, runs agent on each batch sequentially,
+    and merges all comments. Deduplication happens later in Quartz moderator.
+    Returns AgentResult with comments and any warnings about skipped content.
+    """
+    chunk_result = chunk_files_by_char_budget(pr.files, max_chars=max_chars, max_files=max_files)
+    batches = chunk_result.batches
+    warnings: list[ReviewWarning] = []
+
+    # Add warnings for skipped large files
+    for skipped_file in chunk_result.skipped_files:
+        warnings.append(ReviewWarning(
+            kind="skipped_large_file",
+            message=f"File too large to review (>60K chars)",
+            file=skipped_file,
+        ))
+
+    if not batches:
+        return AgentResult(comments=[], warnings=warnings)
+
+    # Cap batches to limit API costs
+    if len(batches) > max_batches:
+        skipped_batch_count = len(batches) - max_batches
+        skipped_file_count = sum(len(batch) for batch in batches[max_batches:])
+        print(f"[QuartzCouncil] ⚠️ {agent_name} capping at {max_batches} batches (skipping {skipped_batch_count} batches, {skipped_file_count} files)")
+        warnings.append(ReviewWarning(
+            kind="rate_limited",
+            message=f"PR too large: reviewed first {max_batches} batches, skipped {skipped_file_count} files",
+        ))
+        batches = batches[:max_batches]
+
+    if len(batches) > 1:
+        print(f"[QuartzCouncil] 📦 {agent_name} processing {len(batches)} batches...")
+
+    all_comments: list[ReviewComment] = []
+    all_token_usage: list[TokenUsage] = []
+
+    for batch_index, batch_files in enumerate(batches):
+        batch_pr = PullRequestInput(
+            number=pr.number,
+            title=pr.title,
+            files=batch_files,
+            base_sha=pr.base_sha,
+            head_sha=pr.head_sha,
+        )
+
+        if len(batches) > 1:
+            print(f"[QuartzCouncil] 📦 {agent_name} batch {batch_index + 1}/{len(batches)} ({len(batch_files)} files)")
+
+        comments, batch_failed, usage = await run_review_agent(batch_pr, agent_name, prompt, batch_index)
+        all_comments.extend(comments)
+        all_token_usage.append(usage)
+
+        if batch_failed:
+            file_names = [f.filename for f in batch_files]
+            warnings.append(ReviewWarning(
+                kind="batch_output_limit",
+                message=f"Output limit hit, batch partially reviewed: {', '.join(file_names[:3])}{'...' if len(file_names) > 3 else ''}",
+            ))
+
+    return AgentResult(comments=all_comments, warnings=warnings, token_usage=all_token_usage)
