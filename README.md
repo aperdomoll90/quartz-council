@@ -215,7 +215,7 @@ src/quartzcouncil/
 
 | Control | Value | Purpose |
 |---------|-------|---------|
-| Rate limit | 5 reviews/hour/installation | Prevent spam/abuse |
+| Idempotency | 1 review per commit | Prevents duplicate reviews; links to existing |
 | Max batches | 5 per agent (10 total) | Cap API costs |
 | Max file size | 60K chars | Skip generated/minified files |
 | Batch size | ~40K chars, 12 files | Stay within token limits |
