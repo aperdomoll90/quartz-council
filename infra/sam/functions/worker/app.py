@@ -102,8 +102,10 @@ async def _process_review(job: dict) -> dict:
     installation_id = int(job["installation_id"])
     triggered_by = job.get("triggered_by")
     triggered_by_id = job.get("triggered_by_id")
+    agents_override = job.get("agents")  # None = all, or list like ["amethyst", "citrine"]
 
-    print(f"[Worker] Processing review: {owner}/{repo}#{pr_number} (triggered by @{triggered_by})")
+    agents_str = ", ".join(agents_override) if agents_override else "all"
+    print(f"[Worker] Processing review: {owner}/{repo}#{pr_number} (triggered by @{triggered_by}, agents: {agents_str})")
 
     # Get installation token
     token = await get_installation_token(installation_id)
@@ -159,6 +161,7 @@ async def _process_review(job: dict) -> dict:
         cfg=repo_config,
         triggered_by=triggered_by,
         triggered_by_id=triggered_by_id,
+        agents_override=agents_override,
     )
 
     print(f"[Worker] Council complete: {len(review.comments)} comments")

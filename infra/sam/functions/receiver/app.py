@@ -51,11 +51,47 @@ def _is_pr_issue_comment(payload: dict) -> bool:
     return "pull_request" in issue
 
 
-def _is_quartz_review_command(payload: dict) -> bool:
-    """Check if the comment is a /quartz review command."""
+def _parse_quartz_command(payload: dict) -> dict | None:
+    """
+    Parse /quartz command from comment.
+
+    Supported formats:
+    - /quartz review          → Run all agents (default)
+    - /quartz amethyst        → Run only Amethyst (TypeScript)
+    - /quartz citrine         → Run only Citrine (React/Next)
+    - /quartz chalcedony      → Run only Chalcedony (conventions)
+    - /quartz amethyst citrine → Run multiple specific agents
+
+    Returns dict with 'agents' key (list of agent names) or None if not a quartz command.
+    """
     comment = payload.get("comment") or {}
-    body = (comment.get("body") or "").strip()
-    return body.startswith("/quartz review")
+    body = (comment.get("body") or "").strip().lower()
+
+    if not body.startswith("/quartz"):
+        return None
+
+    # Parse the command parts
+    parts = body.split()
+
+    # /quartz alone or /quartz review → run all agents
+    if len(parts) == 1 or (len(parts) == 2 and parts[1] == "review"):
+        return {"agents": None}  # None means all agents
+
+    # Parse specific agent names
+    valid_agents = {"amethyst", "citrine", "chalcedony"}
+    requested_agents = []
+
+    for part in parts[1:]:
+        if part == "review":
+            continue  # Skip "review" keyword
+        if part in valid_agents:
+            requested_agents.append(part)
+
+    # If we found valid agents, return them; otherwise treat as "run all"
+    if requested_agents:
+        return {"agents": requested_agents}
+
+    return {"agents": None}
 
 
 def handler(event, context):
@@ -93,9 +129,11 @@ def handler(event, context):
 
     triggered = False
 
-    # Check for /quartz review command on PR
+    # Check for /quartz command on PR
     if github_event == "issue_comment" and payload.get("action") == "created":
-        if _is_pr_issue_comment(payload) and _is_quartz_review_command(payload):
+        command = _parse_quartz_command(payload) if _is_pr_issue_comment(payload) else None
+
+        if command is not None:
             owner = payload["repository"]["owner"]["login"]
             repo = payload["repository"]["name"]
             pr_number = int(payload["issue"]["number"])
@@ -114,6 +152,7 @@ def handler(event, context):
                 "delivery_id": delivery_id,
                 "triggered_by": triggered_by,
                 "triggered_by_id": triggered_by_id,
+                "agents": command["agents"],  # None = all, or list of specific agents
             }
 
             queue_url = os.environ["REVIEW_QUEUE_URL"]
@@ -122,7 +161,8 @@ def handler(event, context):
                 MessageBody=json.dumps(job),
             )
 
-            print(f"[Receiver] Enqueued review job: {owner}/{repo}#{pr_number} (triggered by @{triggered_by})")
+            agents_str = ", ".join(command["agents"]) if command["agents"] else "all"
+            print(f"[Receiver] Enqueued review job: {owner}/{repo}#{pr_number} (triggered by @{triggered_by}, agents: {agents_str})")
             triggered = True
 
     return {"statusCode": 200, "body": json.dumps({"ok": True, "triggered": triggered})}
