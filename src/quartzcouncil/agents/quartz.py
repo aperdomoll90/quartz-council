@@ -455,6 +455,7 @@ async def review_council(
     max_comments: int = 20,
     triggered_by: str | None = None,
     triggered_by_id: int | None = None,
+    agents_override: list[str] | None = None,
 ) -> CouncilReview:
     """
     Run the Quartz council review.
@@ -475,12 +476,49 @@ async def review_council(
         max_comments: Maximum distinct locations for Amethyst+Citrine (default 20)
         triggered_by: GitHub username of the person who triggered the review
         triggered_by_id: GitHub user ID of the person who triggered the review
+        agents_override: Optional list of agent names to run (e.g., ["amethyst", "citrine"]).
+                        If provided, only these agents run (overrides config).
+                        If None, uses config or defaults to all agents.
     """
+    # ==========================================================================
+    # CHECK AGENT TOGGLES
+    # ==========================================================================
+    # Priority: agents_override (from command) > config > defaults
+
+    # Start with defaults
+    amethyst_enabled = True
+    citrine_enabled = True
+    chalcedony_enabled = True
+
+    # If agents_override is provided (from /quartz command), it takes priority
+    if agents_override is not None:
+        amethyst_enabled = "amethyst" in agents_override
+        citrine_enabled = "citrine" in agents_override
+        chalcedony_enabled = "chalcedony" in agents_override
+        print(f"[QuartzCouncil] 🎯 Agent override from command: {', '.join(agents_override)}")
+
+    # Otherwise, check config toggles
+    elif cfg is not None:
+        amethyst_enabled = cfg.agents.amethyst
+        citrine_enabled = cfg.agents.citrine
+        chalcedony_enabled = cfg.agents.chalcedony
+
+        disabled_agents = []
+        if not amethyst_enabled:
+            disabled_agents.append("Amethyst")
+        if not citrine_enabled:
+            disabled_agents.append("Citrine")
+        if not chalcedony_enabled:
+            disabled_agents.append("Chalcedony")
+
+        if disabled_agents:
+            print(f"[QuartzCouncil] 🔕 Disabled agents (via config): {', '.join(disabled_agents)}")
+
     # Route files to agents based on extension
     # Currently permissive - both agents see JS/TS files
     # TODO: Tighten routing as we learn agent strengths
-    amethyst_files = _filter_files_for_agent(pr.files, AMETHYST_EXTENSIONS)
-    citrine_files = _filter_files_for_agent(pr.files, CITRINE_EXTENSIONS)
+    amethyst_files = _filter_files_for_agent(pr.files, AMETHYST_EXTENSIONS) if amethyst_enabled else []
+    citrine_files = _filter_files_for_agent(pr.files, CITRINE_EXTENSIONS) if citrine_enabled else []
 
     # Build filtered PR inputs for each agent
     amethyst_pr = PullRequestInput(
@@ -508,11 +546,11 @@ async def review_council(
         core_tasks.append(review_citrine(citrine_pr))
 
     # ==========================================================================
-    # RUN CHALCEDONY SEPARATELY - repo conventions (if config exists)
+    # RUN CHALCEDONY SEPARATELY - repo conventions (if config exists and enabled)
     # ==========================================================================
     chalcedony_task = None
     chalcedony_max_comments = 0  # default: 0 = uncapped (report all violations)
-    if cfg is not None and cfg.has_any_rules():
+    if cfg is not None and cfg.has_any_rules() and chalcedony_enabled:
         chalcedony_task = review_chalcedony(pr, cfg)
         chalcedony_max_comments = cfg.limits.max_comments
         print(f"[QuartzCouncil] 🔧 Chalcedony max_comments from config: {chalcedony_max_comments}")

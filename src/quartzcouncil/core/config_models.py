@@ -172,6 +172,18 @@ class Limits(BaseModel):
 
 
 # =============================================================================
+# AGENT TOGGLES
+# =============================================================================
+
+
+class AgentToggles(BaseModel):
+    """Enable/disable individual review agents."""
+    amethyst: bool = True   # TypeScript type safety
+    citrine: bool = True    # React/Next.js performance
+    chalcedony: bool = True # Repo-specific conventions (requires rules to be defined)
+
+
+# =============================================================================
 # ROOT CONFIG
 # =============================================================================
 
@@ -183,6 +195,12 @@ class QuartzCouncilConfig(BaseModel):
     Example YAML:
 
     version: 1
+
+    # Agent toggles - enable/disable specific reviewers
+    agents:
+      amethyst: true   # TypeScript type safety
+      citrine: true    # React/Next.js performance
+      chalcedony: true # Repo conventions (requires rules below)
 
     limits:
       max_comments: 5
@@ -210,6 +228,7 @@ class QuartzCouncilConfig(BaseModel):
     limits: Limits = Field(default_factory=Limits)
     rules: RuleToggles = Field(default_factory=RuleToggles)
     policy: list[PolicyRule] = Field(default_factory=list)
+    agents: AgentToggles = Field(default_factory=AgentToggles)
 
     @field_validator("policy")
     @classmethod
