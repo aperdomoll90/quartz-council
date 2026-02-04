@@ -26,14 +26,12 @@ from quartzcouncil.agents.chalcedony import review_chalcedony
 
 # Amethyst: TypeScript type safety reviewer
 # Permissive: includes JS/JSX since they may have JSDoc types or be migrated
-# TODO: For now includes .py for testing on this repo - remove later
-AMETHYST_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".py"}
+AMETHYST_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"}
 
 # Citrine: React/Next.js reviewer
 # Permissive: same as Amethyst since React can be in any JS/TS file
 # TODO: Could detect React imports or hooks to filter more precisely
-# TODO: For now includes .py for testing on this repo - remove later
-CITRINE_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".py"}
+CITRINE_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mts", ".cts"}
 
 
 def _filter_files_for_agent(

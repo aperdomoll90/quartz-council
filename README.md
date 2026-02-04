@@ -386,3 +386,4 @@ Found 1 installation(s):
 | **Agate** | Architecture (boundaries, ownership, coupling) | `arch` |
 | **Phantom** | Refactors & legacy risk (state evolution, regression traps) | `arch` |
 | **Rose** | UX heuristics (interaction clarity, comfort, motion restraint) | `ux` |
+| **Jasper** | Modern JS idioms (array methods over loops, destructuring, optional chaining) | `style` |
